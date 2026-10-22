@@ -32,7 +32,7 @@ static BOOL gCornerTapScreenshot = YES;
 static BOOL gThreeFingerHome = YES;
 static BOOL gThreeFingerSwitcher = YES;
 static BOOL gVibrationFeedback = YES;
-static BOOL gDebugLog = NO;
+static BOOL gDebugLog = YES;   // v1.4.0: on by default for diagnosis
 
 // launcher panel
 static BOOL gPanelEnabled = YES;
@@ -45,6 +45,8 @@ static SGLauncherVC *gPanelVC;
 static __weak UIWindow *gPanelPrevKey;
 static void SGLauncherShow(void);
 static void SGLauncherHide(void);
+
+static __weak UIWindowScene *gCachedScene = nil;
 
 @interface SGKeyboardOwner : NSObject
 + (void)take;
@@ -92,6 +94,9 @@ static void loadPrefs(void) {
 #undef LOAD
 
     NSArray *list = p[@"PanelApps"];
+    if (!list) list = @[ @"com.apple.MobileSMS", @"com.apple.mobilesafari",
+                         @"com.apple.camera", @"com.apple.mobiletimer",
+                         @"com.apple.mobilenotes", @"com.apple.calculator" ];
     if ([list isKindOfClass:[NSArray class]]) {
         NSMutableArray *clean = [NSMutableArray array];
         for (id o in list)
@@ -154,6 +159,9 @@ static void initSBS(void) {
 #define kNotifyLock     "com.minis.squidgesture.action.lock"
 #define kNotifySwitcher "com.minis.squidgesture.action.switcher"
 #define kNotifyPanel    "com.minis.squidgesture.action.panel"
+// Fire this from a shell to open the panel without touching the screen:
+//   notify_post com.minis.squidgesture.test.panel
+#define kNotifyTest     "com.minis.squidgesture.test.panel"
 
 static void vibrate(void) {
     if (gVibrationFeedback) AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
@@ -583,6 +591,10 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 
 - (void)layoutSheet {
     CGSize s = self.view.bounds.size;
+    if (s.width < 10 || s.height < 10) {
+        s = [UIScreen mainScreen].bounds.size;      // window not sized yet
+        self.view.frame = CGRectMake(0, 0, s.width, s.height);
+    }
     if (s.width < 10) return;
 
     CGFloat margin = 14;
@@ -945,67 +957,142 @@ static UIWindow *SBCurrentKeyWindow(void) {
     return nil;
 }
 
-static UIWindow *SGMakePanelWindow(void) {
-    UIWindow *win = nil;
-    UIWindowScene *scene = nil;
+static UIWindowScene *SGPickScene(void) {
+    // 1) scene captured while SpringBoard created / keyed its own windows
+    if (gCachedScene) return gCachedScene;
 
-    for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
-        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-        if (!scene) scene = (UIWindowScene *)sc;
-        if (sc.activationState == UISceneActivationStateForegroundActive) {
-            scene = (UIWindowScene *)sc;
-            break;
+    // 2) any connected scene in this process
+    @try {
+        UIWindowScene *any = nil;
+        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            if (!any) any = (UIWindowScene *)sc;
+            if (sc.activationState == UISceneActivationStateForegroundActive)
+                return (UIWindowScene *)sc;
         }
+        if (any) return any;
+    } @catch (__unused NSException *e) {
     }
-    if (!scene) {
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (w.windowScene) {
-                scene = w.windowScene;
-                break;
+
+    // 3) the scene of any live window
+    @try {
+        for (UIWindow *w in [UIApplication sharedApplication].windows)
+            if (w.windowScene) return w.windowScene;
+    } @catch (__unused NSException *e) {
+    }
+
+    // 4) SpringBoard's own private accessors
+    Class sbClass = objc_getClass("SpringBoard");
+    if (sbClass) {
+        SEL sh = NSSelectorFromString(@"sharedInstance");
+        id sb = [sbClass respondsToSelector:sh] ? ((id(*)(id, SEL))objc_msgSend)(sbClass, sh) : nil;
+        for (NSString *selName in @[ @"_windowScene", @"_mainWindowScene", @"windowScene" ]) {
+            SEL sel = NSSelectorFromString(selName);
+            if (sb && [sb respondsToSelector:sel]) {
+                @try {
+                    id sc = ((id(*)(id, SEL))objc_msgSend)(sb, sel);
+                    if ([sc isKindOfClass:[UIWindowScene class]]) return (UIWindowScene *)sc;
+                } @catch (__unused NSException *e) {
+                }
             }
         }
     }
 
-    if (scene && [UIWindow instancesRespondToSelector:NSSelectorFromString(@"initWithWindowScene:")])
-        win = ((id(*)(id, SEL, id))objc_msgSend)([UIWindow alloc],
-                                                 NSSelectorFromString(@"initWithWindowScene:"), scene);
-    else
-        win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    // 5) SBWindowScene's current scene, via the scene manager
+    Class smClass = objc_getClass("SBSceneManager");
+    if (smClass) {
+        SEL sh = NSSelectorFromString(@"sharedInstance");
+        id sm = [smClass respondsToSelector:sh] ? ((id(*)(id, SEL))objc_msgSend)(smClass, sh) : nil;
+        for (NSString *selName in @[ @"_windowScene", @"mainWindowScene", @"currentWindowScene" ]) {
+            SEL sel = NSSelectorFromString(selName);
+            if (sm && [sm respondsToSelector:sel]) {
+                @try {
+                    id sc = ((id(*)(id, SEL))objc_msgSend)(sm, sel);
+                    if ([sc isKindOfClass:[UIWindowScene class]]) return (UIWindowScene *)sc;
+                } @catch (__unused NSException *e) {
+                }
+            }
+        }
+    }
+    return nil;
+}
+
+static UIWindow *SGMakePanelWindow(void) {
+    UIWindowScene *scene = SGPickScene();
+    UIWindow *win = nil;
+
+    if (scene) {
+        @try {
+            win = ((id(*)(id, SEL, id))objc_msgSend)([UIWindow alloc],
+                                                     NSSelectorFromString(@"initWithWindowScene:"),
+                                                     scene);
+        } @catch (NSException *e) {
+            SGLog(@"initWithWindowScene threw: %@", e);
+            win = nil;
+        }
+    }
+    if (!win) win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
 
     if (!win.windowScene && scene) {
         SEL s2 = NSSelectorFromString(@"_setWindowScene:");
-        if ([win respondsToSelector:s2]) ((void(*)(id, SEL, id))objc_msgSend)(win, s2, scene);
+        if ([win respondsToSelector:s2])
+            ((void(*)(id, SEL, id))objc_msgSend)(win, s2, scene);
     }
 
     win.frame = [UIScreen mainScreen].bounds;
     win.windowLevel = 5000.0;
     win.backgroundColor = [UIColor clearColor];
     win.hidden = YES;
-    SGLog(@"panel window ready level=%.1f scene=%@", (double)win.windowLevel,
-          win.windowScene ? @"yes" : @"no");
+    SGLog(@"panel window: scene=%@ level=%.1f frame=%@",
+          win.windowScene ? NSStringFromClass([win.windowScene class]) : @"NIL",
+          (double)win.windowLevel, NSStringFromCGRect(win.frame));
     return win;
 }
 
 static void SGLauncherShow(void) {
-    if (!isSpringBoard()) return;
-    if (!gPanelEnabled) return;
+    SGLog(@"SGLauncherShow enter isSpringBoard=%d enabled=%d", isSpringBoard(), gPanelEnabled);
+    if (!isSpringBoard()) { SGLog(@"SGLauncherShow: not SpringBoard -> abort"); return; }
+    if (!gPanelEnabled) { SGLog(@"SGLauncherShow: PanelEnabled=NO -> abort"); return; }
     dispatch_async(dispatch_get_main_queue(), ^{
       if (gPanelWindow && !gPanelWindow.hidden) {
           [gPanelVC hidePanel];   // toggle off
           return;
       }
       if (!gPanelWindow) {
-          gPanelWindow = SGMakePanelWindow();
-          gPanelVC = [[SGLauncherVC alloc] init];
-          gPanelWindow.rootViewController = gPanelVC;
+          @try {
+              gPanelWindow = SGMakePanelWindow();
+              gPanelVC = [[SGLauncherVC alloc] init];
+              gPanelWindow.rootViewController = gPanelVC;
+          } @catch (NSException *e) {
+              SGLog(@"panel window creation FAILED: %@", e);
+              gPanelWindow = nil;
+              gPanelVC = nil;
+              return;
+          }
       }
+      if (!gPanelWindow) { SGLog(@"no panel window -> abort"); return; }
       // Deliberately not makeKeyAndVisible: the frontmost app keeps keyboard focus
       // and text input. SGKeyboardOwner takes key status only for the search field.
       if (gPanelWindow.rootViewController != gPanelVC) gPanelWindow.rootViewController = gPanelVC;
+      gPanelWindow.frame = [UIScreen mainScreen].bounds;
+      // A plain `hidden = NO` is not enough for a window created inside SpringBoard:
+      // it has to become key at least once or it never gets composited.
+      // We restore the previous key window on hide.
+      if (!gPanelPrevKey) {
+          for (UIWindow *w in [UIApplication sharedApplication].windows)
+              if (w.isKeyWindow && w.windowLevel < 4000) { gPanelPrevKey = w; break; }
+      }
       gPanelWindow.hidden = NO;
       gPanelWindow.alpha = 1.0;
+      [gPanelWindow makeKeyAndVisible];
+      gPanelVC.view.frame = gPanelWindow.bounds;
+      [gPanelVC.view setNeedsLayout];
+      [gPanelVC.view layoutIfNeeded];
       [gPanelVC showPanel];
-      SGLog(@"panel shown");
+      SGLog(@"panel shown win=%@ level=%.1f scene=%@ vcView=%@ hidden=%d",
+            NSStringFromCGRect(gPanelWindow.frame), (double)gPanelWindow.windowLevel,
+            gPanelWindow.windowScene ? @"yes" : @"NO", NSStringFromCGRect(gPanelVC.view.frame),
+            gPanelWindow.hidden);
     });
 }
 
@@ -1112,7 +1199,10 @@ static void actionNotifyCb(CFNotificationCenterRef c, void *o, CFStringRef n,
         } else if (CFStringCompare(n, CFSTR(kNotifyHome), 0) == kCFCompareEqualTo) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ sbHome(); });
-        } else if (CFStringCompare(n, CFSTR(kNotifyPanel), 0) == kCFCompareEqualTo) {
+        } else if (CFStringCompare(n, CFSTR(kNotifyPanel), 0) == kCFCompareEqualTo ||
+                   CFStringCompare(n, CFSTR(kNotifyTest), 0) == kCFCompareEqualTo) {
+            SGLog(@"panel notify received (%@)",
+                  CFStringCompare(n, CFSTR(kNotifyTest), 0) == kCFCompareEqualTo ? @"manual" : @"gesture");
             if (gPanelWindow && !gPanelWindow.hidden) [gPanelVC hidePanel];
             else SGLauncherShow();
         }
@@ -1159,6 +1249,7 @@ static void doLock(void) {
 }
 
 static void doPanel(void) {
+    SGLog(@"doPanel isSpringBoard=%d panelEnabled=%d", isSpringBoard(), gPanelEnabled);
     SGPanelVibrate();
     if (isSpringBoard()) {
         if (gPanelWindow && !gPanelWindow.hidden) [gPanelVC hidePanel];
@@ -1287,6 +1378,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 
 - (void)attachToWindow:(UIWindow *)window {
     if (!window) return;
+    if (window.windowScene && !gCachedScene) gCachedScene = window.windowScene;
     if (window.windowLevel >= 4000) return;   // our own panel window
     if (objc_getAssociatedObject(window, &kAttachedKey)) return;
     objc_setAssociatedObject(window, &kAttachedKey, @YES,
@@ -1353,22 +1445,27 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     if (!v) return NO;
     CGPoint p = [g locationInView:v];
     CGSize s = v.bounds.size;
-    CGFloat boxW = MAX(gCornerSize * 1.6, 140.0);
-    CGFloat boxH = MAX(gCornerSize * 2.4, 220.0);
-    if (p.x < s.width - boxW || p.y < s.height - boxH) return NO;
-    CGPoint t = [(UIPanGestureRecognizer *)g translationInView:v];
-    if (t.y > 2) return NO;
-    return YES;
+    // Start anywhere in the lower-right region - NOT only on the extreme bottom
+    // edge, because that is exactly where the system home-swipe grabs the touch.
+    CGFloat boxW = MAX(gCornerSize * 2.4, 190.0);
+    CGFloat boxH = MAX(gCornerSize * 4.0, 380.0);
+    BOOL inBox = (p.x > s.width - boxW) && (p.y > s.height - boxH);
+    SGLog(@"panelPan begin %.0f,%.0f box %.0fx%.0f -> %d", p.x, p.y, boxW, boxH, inBox);
+    return inBox;
 }
 
 - (void)onPanelPan:(UIPanGestureRecognizer *)g {
     if (!gEnabled || !gPanelEnabled) return;
-    if (g.state != UIGestureRecognizerStateEnded) return;
+    UIGestureRecognizerState st = g.state;
+    // Cancelled counts: the system home gesture often takes over mid-swipe.
+    if (st != UIGestureRecognizerStateEnded && st != UIGestureRecognizerStateCancelled) return;
+
     CGPoint t = [g translationInView:g.view];
     CGPoint vel = [g velocityInView:g.view];
-    BOOL upward = (t.y < -55 || vel.y < -650);
-    BOOL vertical = fabs(t.y) > fabs(t.x) * 1.2;
-    SGLog(@"panelPan t=%.0f,%.0f v=%.0f up=%d vert=%d", t.x, t.y, vel.y, upward, vertical);
+    BOOL upward = (t.y < -45 || vel.y < -500);
+    BOOL vertical = fabs(t.y) > fabs(t.x) * 1.1;
+    SGLog(@"panelPan state=%ld t=%.0f,%.0f v=%.0f up=%d vert=%d",
+          (long)st, t.x, t.y, vel.y, upward, vertical);
     if (upward && vertical) doPanel();
 }
 
@@ -1408,6 +1505,11 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 #pragma mark - Hooks
 
 %hook UIWindow
+- (id)initWithWindowScene:(UIWindowScene *)scene {
+    id r = %orig;
+    if (scene && !gCachedScene) gCachedScene = scene;
+    return r;
+}
 - (void)becomeKeyWindow {
     %orig;
     if (gEnabled) [[SGHandler shared] attachToWindow:self];
@@ -1455,6 +1557,9 @@ static void attachAllWindows(void) {
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
             CFSTR(kNotifyPanel), NULL, CFNotificationSuspensionBehaviorCoalesce);
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
+            CFSTR(kNotifyTest), NULL, CFNotificationSuspensionBehaviorCoalesce);
     }
 
     // Attach immediately + polled re-attach (covers windows created later,
