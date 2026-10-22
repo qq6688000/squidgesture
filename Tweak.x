@@ -158,6 +158,8 @@ static void initSBS(void) {
 #define kNotifyHome     "com.minis.squidgesture.action.home"
 #define kNotifyLock     "com.minis.squidgesture.action.lock"
 #define kNotifySwitcher "com.minis.squidgesture.action.switcher"
+#define kNotifyScreenshot "com.minis.squidgesture.action.screenshot"
+static void sbScreenshotAndSave(void);
 #define kNotifyPanel    "com.minis.squidgesture.action.panel"
 // Fire this from a shell to open the panel without touching the screen:
 //   notify_post com.minis.squidgesture.test.panel
@@ -1144,22 +1146,55 @@ static void sbHome(void) {
 }
 
 static void sbLock(void) {
-    mach_port_t p = gGetPort ? gGetPort() : 0;
-    SGLog(@"sbLock: port=%u lock=%p dim=%p", p, gLockDevice, gDimScreen);
-    if (p && gLockDevice) {
-        gLockDevice(p, 1);   // exactly what Apple's DMDLockUtilities does
-        if (gDimScreen) gDimScreen(p, 1);
-        return;
+    SGLog(@"sbLock enter");
+    // PRIMARY: backlight fade-out == the hardware lock button's path
+    //   SBBacklightController _startFadeOutAnimationFromLockSource:
+    //     -> screenSleepCoordinator sleepAndLockUIFromSource:
+    // This both locks AND physically turns the display off.
+    // (v1.2/v1.4 used SBLockDevice(port,1), which locks but leaves the screen
+    //  lit -- reported as "lock works but screen never goes dark".)
+    Class blc = objc_getClass("SBBacklightController");
+    if (blc) {
+        id bl = ((id(*)(id, SEL))objc_msgSend)(blc, NSSelectorFromString(@"sharedInstance"));
+        SEL fade = NSSelectorFromString(@"_startFadeOutAnimationFromLockSource:");
+        SGLog(@"sbLock: bl=%p fade=%d", bl, bl && [bl respondsToSelector:fade]);
+        if (bl && [bl respondsToSelector:fade]) {
+            ((void(*)(id, SEL, int))objc_msgSend)(bl, fade, 11);
+            return;
+        }
     }
-    // Fallback chain
-    Class c = objc_getClass("SBLockScreenManager");
-    if (c) {
-        id inst = ((id(*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"sharedInstance"));
+
+    // SECONDARY: lock screen manager with the exact options the system
+    // lock button builds (ForceLockKey + LockAutomatically, source 11).
+    Class lsmc = objc_getClass("SBLockScreenManager");
+    if (lsmc) {
+        id inst = ((id(*)(id, SEL))objc_msgSend)(lsmc, NSSelectorFromString(@"sharedInstance"));
         SEL sel = NSSelectorFromString(@"lockUIFromSource:withOptions:");
         if (inst && [inst respondsToSelector:sel]) {
-            SGLog(@"sbLock: SBS lockUIFromSource fallback");
-            ((void(*)(id, SEL, long, id))objc_msgSend)(inst, sel, 0, nil);
+            NSDictionary *opts = @{
+                @"SBUILockOptionsForceLockKey"         : @YES,
+                @"SBUILockOptionsLockAutomaticallyKey" : @YES,
+            };
+            SGLog(@"sbLock: lockUIFromSource:11");
+            ((void(*)(id, SEL, int, id))objc_msgSend)(inst, sel, 11, opts);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                Class b2c = objc_getClass("SBBacklightController");
+                id b2 = ((id(*)(id, SEL))objc_msgSend)(b2c, NSSelectorFromString(@"sharedInstance"));
+                SEL f2 = NSSelectorFromString(@"_startFadeOutAnimationFromLockSource:");
+                if (b2 && [b2 respondsToSelector:f2])
+                    ((void(*)(id, SEL, int))objc_msgSend)(b2, f2, 11);
+            });
+            return;
         }
+    }
+
+    // LAST RESORT: C API (locks, may not dim)
+    mach_port_t p = gGetPort ? gGetPort() : 0;
+    SGLog(@"sbLock: C fallback port=%u lock=%p dim=%p", p, gLockDevice, gDimScreen);
+    if (p && gLockDevice) {
+        gLockDevice(p, 1);
+        if (gDimScreen) gDimScreen(p, 1);
     }
 }
 
@@ -1196,6 +1231,8 @@ static void actionNotifyCb(CFNotificationCenterRef c, void *o, CFStringRef n,
             vibrate(); sbLock();
         } else if (CFStringCompare(n, CFSTR(kNotifySwitcher), 0) == kCFCompareEqualTo) {
             vibrate(); sbSwitcher();
+        } else if (CFStringCompare(n, CFSTR(kNotifyScreenshot), 0) == kCFCompareEqualTo) {
+            sbScreenshotAndSave();   // app side already vibrated + flashed
         } else if (CFStringCompare(n, CFSTR(kNotifyHome), 0) == kCFCompareEqualTo) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ sbHome(); });
@@ -1265,21 +1302,49 @@ static void doSwitcher(void) {
     notify_post(kNotifySwitcher);
 }
 
+// Walk UP the controller hierarchy (and through children) to find any
+// UINavigationController with something to pop. QQ's chat screen keeps its nav
+// controller deeper than topVC, which is why the plain property lookup failed.
+static UINavigationController *findNav(UIViewController *vc, int depth) {
+    if (!vc || depth > 8) return nil;
+    if ([vc isKindOfClass:[UINavigationController class]]) {
+        UINavigationController *n = (UINavigationController *)vc;
+        if (n.viewControllers.count > 1) return n;
+    }
+    if ([vc isKindOfClass:[UITabBarController class]]) {
+        UINavigationController *n =
+            findNav([(UITabBarController *)vc selectedViewController], depth + 1);
+        if (n) return n;
+    }
+    for (UIViewController *c in vc.childViewControllers) {
+        UINavigationController *n = findNav(c, depth + 1);
+        if (n) return n;
+    }
+    UINavigationController *n = findNav(vc.parentViewController, depth + 1);
+    if (n) return n;
+    if (vc.presentingViewController)
+        n = findNav(vc.presentingViewController, depth + 1);
+    return n;
+}
+
 static void doBack(void) {
     vibrate();
-    UIViewController *vc = topVC();
-    if (!vc) return;
-    UINavigationController *nav = vc.navigationController;
+    UINavigationController *nav = findNav(topVC(), 0);
     if (!nav) {
         UIWindow *win = [UIApplication sharedApplication].keyWindow;
-        UIViewController *root = win ? win.rootViewController : nil;
-        if ([root isKindOfClass:[UITabBarController class]]) {
-            UIViewController *sel = [(UITabBarController *)root selectedViewController];
-            if ([sel isKindOfClass:[UINavigationController class]])
-                nav = (UINavigationController *)sel;
-        }
+        nav = findNav(win.rootViewController, 0);
     }
-    if (nav && nav.viewControllers.count > 1) [nav popViewControllerAnimated:YES];
+    SGLog(@"doBack nav=%p stack=%lu", nav, (unsigned long)nav.viewControllers.count);
+    if (nav && nav.viewControllers.count > 1) {
+        [nav popViewControllerAnimated:YES];
+        return;
+    }
+    // No nav stack: dismiss a modally presented controller instead.
+    UIViewController *top = topVC();
+    if (top && top.presentingViewController) {
+        [top dismissViewControllerAnimated:YES completion:nil];
+        SGLog(@"doBack dismissed modal");
+    }
 }
 
 // Crash-proof screenshot flash overlay
@@ -1290,7 +1355,8 @@ static void showFlash(void) {
     w.alpha = 1.0;
     w.userInteractionEnabled = NO;
     w.rootViewController = [[UIViewController alloc] init];
-    [w makeKeyAndVisible];
+    // NOT makeKeyAndVisible: stealing key status broke later gestures.
+    w.hidden = NO;
     [UIView animateWithDuration:0.28 animations:^{
         w.alpha = 0.0;
     } completion:^(BOOL finished) {
@@ -1298,52 +1364,48 @@ static void showFlash(void) {
     }];
 }
 
+static void sbScreenshotAndSave(void) {
+    // Runs INSIDE SpringBoard: compositing every window here captures the
+    // status bar and system UI too, which an app-process render cannot see.
+    CGRect scr = [UIScreen mainScreen].bounds;
+    SGLog(@"sbShot size=%.0fx%.0f", scr.size.width, scr.size.height);
+    UIGraphicsImageRenderer *r =
+        [[UIGraphicsImageRenderer alloc] initWithSize:scr.size];
+    UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.hidden || w.alpha <= 0.01) continue;
+            CGContextSaveGState(ctx.CGContext);
+            CGContextTranslateCTM(ctx.CGContext, w.frame.origin.x, w.frame.origin.y);
+            [w.layer renderInContext:ctx.CGContext];
+            CGContextRestoreGState(ctx.CGContext);
+        }
+    }];
+    if (!img) { SGLog(@"sbShot render failed"); return; }
+
+    PHAuthorizationStatus st =
+        [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
+    SGLog(@"sbShot photoAuth=%ld", (long)st);
+    if (st == PHAuthorizationStatusAuthorized || st == PHAuthorizationStatusLimited) {
+        UIImageWriteToSavedPhotosAlbum(img, nil, nil, nil);
+        SGLog(@"sbShot saved to album");
+    } else {
+        NSString *path = [NSTemporaryDirectory()
+            stringByAppendingPathComponent:@"SquidGesture.png"];
+        BOOL ok = [UIImagePNGRepresentation(img) writeToFile:path atomically:YES];
+        SGLog(@"sbShot tmp=%d %@", ok, path);
+    }
+}
+
 static void doScreenshot(void) {
     vibrate();
     SGLog(@"doScreenshot: isSpringBoard=%d", isSpringBoard());
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *window = nil;
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (w.windowLevel == UIWindowLevelNormal && w.bounds.size.width > 0) {
-                window = w; break;
-            }
-        }
-        if (!window) window = [UIApplication sharedApplication].keyWindow;
-        if (!window) { SGLog(@"doScreenshot: no window"); return; }
-        SGLog(@"doScreenshot: window=%@ size=%@", window, NSStringFromCGRect(window.bounds));
-
-        UIGraphicsImageRenderer *r =
-            [[UIGraphicsImageRenderer alloc] initWithSize:window.bounds.size];
-        UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-            [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:YES];
-        }];
-        if (!img) { SGLog(@"doScreenshot: render failed"); return; }
-        SGLog(@"doScreenshot: img=%@", NSStringFromCGSize(img.size));
-        showFlash();
-
-        PHAuthorizationStatus st =
-            [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
-        SGLog(@"doScreenshot: photoAuth=%ld", (long)st);
-
-        if (st == PHAuthorizationStatusAuthorized || st == PHAuthorizationStatusLimited) {
-            UIImageWriteToSavedPhotosAlbum(img, nil, nil, nil);
-            SGLog(@"doScreenshot: saved to album");
-        } else {
-            NSString *path = [NSTemporaryDirectory()
-                stringByAppendingPathComponent:@"SquidGesture.png"];
-            BOOL ok = [UIImagePNGRepresentation(img) writeToFile:path atomically:YES];
-            SGLog(@"doScreenshot: wrote tmp=%d path=%@", ok, path);
-            NSURL *url = [NSURL fileURLWithPath:path];
-            UIActivityViewController *avc = [[UIActivityViewController alloc]
-                initWithActivityItems:@[url] applicationActivities:nil];
-            UIViewController *top = topVC();
-            if (top) {
-                if (avc.popoverPresentationController)
-                    avc.popoverPresentationController.sourceView = top.view;
-                [top presentViewController:avc animated:YES completion:nil];
-            }
-        }
-    });
+    showFlash();
+    if (isSpringBoard()) {
+        sbScreenshotAndSave();
+    } else {
+        // Ask SpringBoard to capture the full screen (all layers).
+        notify_post(kNotifyScreenshot);
+    }
 }
 
 #pragma mark - Gesture Handler
@@ -1354,6 +1416,7 @@ static void doScreenshot(void) {
 @end
 
 static char kAttachedKey;
+static NSTimeInterval gLastCornerAction = 0;
 static char kPanelPanKey;
 
 @implementation SGHandler
@@ -1481,11 +1544,29 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 
 - (void)onCornerTap:(UITapGestureRecognizer *)g {
     if (!gEnabled) return;
-    CGPoint loc = [g locationInView:g.view];
-    CGRect b = g.view.bounds;
-    BOOL topLeft  = loc.x < gCornerSize && loc.y < gCornerSize;
-    BOOL topRight = loc.x > b.size.width - gCornerSize && loc.y < gCornerSize;
-    SGLog(@"cornerTap at %.0f,%.0f L=%d R=%d", loc.x, loc.y, topLeft, topRight);
+
+    // Classify in SCREEN coordinates. g.view.bounds is the coordinate space of
+    // whichever window received the touch -- with recognizers on every window
+    // (needed for QQ) a top-right tap on a narrow overlay window tested as
+    // top-left, so BOTH corners ran the lock action.
+    CGPoint winPt = [g locationInView:g.view];
+    UIWindow *w = g.view.window;
+    CGPoint sp = w ? [w convertPoint:winPt toWindow:nil] : winPt;
+    CGRect scr = [UIScreen mainScreen].bounds;
+
+    BOOL topLeft  = sp.x < gCornerSize && sp.y < gCornerSize;
+    BOOL topRight = sp.x > scr.size.width - gCornerSize && sp.y < gCornerSize;
+    SGLog(@"cornerTap screen=(%.0f,%.0f) win=(%.0f,%.0f) scr=%.0fx%.0f L=%d R=%d",
+          sp.x, sp.y, winPt.x, winPt.y, scr.size.width, scr.size.height,
+          topLeft, topRight);
+    if (!topLeft && !topRight) return;
+
+    // Several windows may each report the same physical tap: debounce only
+    // when an action is about to fire.
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - gLastCornerAction < 0.6) { SGLog(@"cornerTap debounced"); return; }
+    gLastCornerAction = now;
+
     if (topLeft && gCornerTapLock) doLock();
     else if (topRight && gCornerTapScreenshot) doScreenshot();
 }
@@ -1554,6 +1635,9 @@ static void attachAllWindows(void) {
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
             CFSTR(kNotifySwitcher), NULL, CFNotificationSuspensionBehaviorCoalesce);
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
+            CFSTR(kNotifyScreenshot), NULL, CFNotificationSuspensionBehaviorCoalesce);
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
             CFSTR(kNotifyPanel), NULL, CFNotificationSuspensionBehaviorCoalesce);
