@@ -1,6 +1,6 @@
 Package: com.minis.squidgesture
 Name: SquidGesture
-Version: 1.0.0
+Version: 1.1.0
 Architecture: iphoneos-arm64
 Description: System-wide gesture control tweak. Edge swipes, corner taps, multi-finger gestures for back/lock/screenshot/home/app-switcher.
 Maintainer: Minis

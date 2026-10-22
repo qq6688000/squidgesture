@@ -45,11 +45,19 @@ dpkg -i com.minis.squidgesture_1.0.0_iphoneos-arm64.deb
 ```
 安装后会自动注销（respring）。
 
-## 技术细节
+## 架构（v1.1.0 两段式）
 
-- **注入目标**：所有 UIKit 应用（`com.apple.UIKit` filter）
-- **arm64+arm64e fat**：兼容 arm64e 进程
-- **PAC stubs**：macOS Apple clang 编译，arm64e PAC 兼容
-- **SpringBoardServices**：dlsym 动态加载 `SBSSpringBoardServerPort` 系列函数
-- **截图**：UIKit `UIGraphicsImageRenderer` + `UIImageWriteToSavedPhotosAlbum`
-- **配置**：plist + Darwin 通知实时刷新
+- **手势检测**（所有 UIKit App 进程）：识别手势 → 振动反馈 → 发 Darwin 通知 / 进程内动作
+- **动作执行**（SpringBoard 进程）：监听 Darwin 通知 → 直接调用 SpringBoard 私有 API
+
+v1.0 的教训：iOS 16 的 SpringBoardServices 只剩 `SBSSpringBoardServerPort` 一个导出符号，`...Home/LockDevice/ShowAppSwitcher` 已被苹果移除（dlsym 返回 NULL，动作静默失败）。且沙盒 App 查不到 SpringBoard mach 服务。两段式彻底避开这两个坑。
+
+## 手势动作实现
+
+| 动作 | 实现 |
+|------|------|
+| Home | 双保险：App 内 `UIApplication suspend`（进程内私有 API）+ Darwin 通知 → SpringBoard `SBSSuspendFrontmostApplication`（tbd 确认存在） |
+| 锁屏 | 通知 → SpringBoard `SBLockScreenManager lockUIFromSource:0 withOptions:nil`（dump 确认） |
+| 多任务 | 通知 → SpringBoard `SBUIController handleHomeButtonDoublePressDown`（系统双击 Home 路径）；fallback `SBMainSwitcherControllerCoordinator toggleMainSwitcherWithSource:animated:` |
+| 截图 | App 内 UIKit 渲染；相册权限已授权→直接存，无权限→弹分享菜单（避免静默失败） |
+| 返回 | App 内 `popViewControllerAnimated:` |

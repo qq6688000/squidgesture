@@ -69,10 +69,10 @@ jobs:
           chmod 755 "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries/SquidGesture.dylib"
 
           dpkg-deb --build --root-owner-group "$STAGE" \
-            "com.minis.squidgesture_1.0.0_iphoneos-arm64.deb"
+            "com.minis.squidgesture_1.1.0_iphoneos-arm64.deb"
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
         with:
           name: squidgesture-deb
-          path: com.minis.squidgesture_1.0.0_iphoneos-arm64.deb
+          path: com.minis.squidgesture_1.1.0_iphoneos-arm64.deb
