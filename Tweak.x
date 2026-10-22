@@ -48,11 +48,6 @@ static void SGLauncherHide(void);
 
 static __weak UIWindowScene *gCachedScene = nil;
 
-@interface SGKeyboardOwner : NSObject
-+ (void)take;
-+ (void)restore;
-@end
-
 static NSString *const kPrefsFile =
     @"/var/mobile/Library/Preferences/com.minis.squidgesture.plist";
 static NSString *const kLogFile =
@@ -115,9 +110,12 @@ static void SGSavePanelApps(NSArray<NSString *> *apps) {
     SGLog(@"save panel apps (%lu) -> %d", (unsigned long)apps.count, ok);
 }
 
+static void SGInvalidateCatalog(void);
+
 static void prefsChangedCb(CFNotificationCenterRef c, void *o, CFStringRef n,
                            const void *obj, CFDictionaryRef ui) {
     loadPrefs();
+    SGInvalidateCatalog();
 }
 
 #pragma mark - Process detection
@@ -158,12 +156,13 @@ static void initSBS(void) {
 #define kNotifyHome     "com.minis.squidgesture.action.home"
 #define kNotifyLock     "com.minis.squidgesture.action.lock"
 #define kNotifySwitcher "com.minis.squidgesture.action.switcher"
-#define kNotifyScreenshot "com.minis.squidgesture.action.screenshot"
-static void sbScreenshotAndSave(void);
 #define kNotifyPanel    "com.minis.squidgesture.action.panel"
 // Fire this from a shell to open the panel without touching the screen:
 //   notify_post com.minis.squidgesture.test.panel
 #define kNotifyTest     "com.minis.squidgesture.test.panel"
+// Emergency escape hatch - force-close the panel from a shell:
+//   notify_post com.minis.squidgesture.test.hide
+#define kNotifyHide     "com.minis.squidgesture.test.hide"
 
 static void vibrate(void) {
     if (gVibrationFeedback) AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
@@ -187,8 +186,13 @@ static void SGPanelVibrate(void) {
 @end
 
 static NSArray<SGCatalogItem *> *gCachedCatalog = nil;
+static BOOL gCatalogLoading = NO;
 
-static void SGInvalidateCatalog(void) { gCachedCatalog = nil; }
+static void SGInvalidateCatalog(void);
+static void SGInvalidateCatalog(void) {
+    gCachedCatalog = nil;
+    gCatalogLoading = NO;
+}
 
 static UIImage *SGLetterIcon(NSString *name, CGSize size) {
     UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:size];
@@ -217,14 +221,13 @@ static UIImage *SGLetterIcon(NSString *name, CGSize size) {
     }];
 }
 
-// Never returns nil.
-static UIImage *SGIconForItem(SGCatalogItem *item) {
+// Synchronous icon resolution. MUST NOT be called on the main thread.
+static UIImage *SGResolveIcon(SGCatalogItem *item) {
     if (item.triedIcon) return item.icon;
     item.triedIcon = YES;
 
     UIImage *img = nil;
     if (item.bundleID.length) {
-        // 1) LSApplicationProxy -iconDataForVariant:
         SEL s1 = NSSelectorFromString(@"iconDataForVariant:");
         if ([item.proxy respondsToSelector:s1]) {
             @try {
@@ -237,19 +240,6 @@ static UIImage *SGIconForItem(SGCatalogItem *item) {
             }
         }
 
-        // 2) UIImage private helper (still present in iOS 16 SpringBoard)
-        if (!img) {
-            SEL s2 = NSSelectorFromString(@"_applicationIconImageForBundleIdentifier:format:scale:");
-            if ([UIImage respondsToSelector:s2]) {
-                @try {
-                    img = ((id(*)(id, SEL, id, int, CGFloat))objc_msgSend)(
-                        [UIImage class], s2, item.bundleID, 2, [UIScreen mainScreen].scale);
-                } @catch (__unused NSException *e) {
-                }
-            }
-        }
-
-        // 3) read the PNG straight out of the bundle (SpringBoard has access)
         if (!img) {
             SEL bsel = NSSelectorFromString(@"bundleURL");
             NSURL *url = nil;
@@ -276,10 +266,15 @@ static UIImage *SGIconForItem(SGCatalogItem *item) {
             }
         }
     }
-
-    if (!img) img = SGLetterIcon(item.name ?: item.bundleID ?: @"?", CGSizeMake(56, 56));
     item.icon = img;
     return img;
+}
+
+// Never blocks: returns the cached icon or a letter placeholder.
+static UIImage *SGIconQuick(SGCatalogItem *item, CGSize size) {
+    if (item.icon) return item.icon;
+    NSString *label = item.name ?: item.bundleID ?: @"?";
+    return SGLetterIcon(label, size);
 }
 
 static id SGLookupWorkspace(void) {
@@ -298,13 +293,12 @@ static id SGLookupWorkspace(void) {
 
 static BOOL SGLaunchApp(NSString *bundleID) {
     if (!bundleID.length) return NO;
-
     id ws = SGLookupWorkspace();
     if (ws) {
         SEL open = NSSelectorFromString(@"openApplicationWithBundleID:");
         if ([ws respondsToSelector:open]) {
             BOOL ok = ((BOOL(*)(id, SEL, id))objc_msgSend)(ws, open, bundleID);
-            SGLog(@"launch %@ via workspace -> %d", bundleID, ok);
+            SGLog(@"launch %@ -> %d", bundleID, ok);
             if (ok) return YES;
         }
         SEL open2 = NSSelectorFromString(@"openApplicationWithBundleID:options:");
@@ -313,13 +307,11 @@ static BOOL SGLaunchApp(NSString *bundleID) {
             if (ok) return YES;
         }
     }
-
     UIApplication *app = [UIApplication sharedApplication];
     SEL l = NSSelectorFromString(@"launchApplicationWithIdentifier:suspended:");
     if ([app respondsToSelector:l]) {
         @try {
             ((void(*)(id, SEL, id, BOOL))objc_msgSend)(app, l, bundleID, NO);
-            SGLog(@"launch %@ via UIApplication", bundleID);
             return YES;
         } @catch (__unused NSException *e) {
         }
@@ -328,9 +320,8 @@ static BOOL SGLaunchApp(NSString *bundleID) {
     return NO;
 }
 
-static NSArray<SGCatalogItem *> *SGLoadCatalog(void) {
-    if (gCachedCatalog) return gCachedCatalog;
-
+// Heavy work - background queue only.
+static NSArray<SGCatalogItem *> *SGEnumerateApps(void) {
     NSMutableArray *out = [NSMutableArray array];
     id ws = SGLookupWorkspace();
     SEL allSel = NSSelectorFromString(@"allInstalledApplications");
@@ -340,33 +331,31 @@ static NSArray<SGCatalogItem *> *SGLoadCatalog(void) {
 
     for (id proxy in apps) {
         @try {
+            NSString *bid = nil;
             SEL sBid = NSSelectorFromString(@"bundleIdentifier");
-            SEL sName = NSSelectorFromString(@"localizedName");
-            SEL sType = NSSelectorFromString(@"applicationType");
-            SEL sHidden = NSSelectorFromString(@"isHidden");
-            SEL sPlace = NSSelectorFromString(@"isPlaceholder");
-
-            NSString *bid = [proxy respondsToSelector:sBid]
-                                ? ((id(*)(id, SEL))objc_msgSend)(proxy, sBid)
-                                : nil;
+            if ([proxy respondsToSelector:sBid])
+                bid = ((id(*)(id, SEL))objc_msgSend)(proxy, sBid);
             if (![bid isKindOfClass:[NSString class]] || !bid.length) continue;
             if ([bid hasPrefix:@"com.apple.WebKit"]) continue;
             if ([bid isEqualToString:@"com.apple.SafariViewService"]) continue;
 
-            NSString *name = [proxy respondsToSelector:sName]
-                                 ? ((id(*)(id, SEL))objc_msgSend)(proxy, sName)
-                                 : bid;
-            if (![name isKindOfClass:[NSString class]] || !name.length) name = bid;
+            NSString *name = bid;
+            SEL sName = NSSelectorFromString(@"localizedName");
+            if ([proxy respondsToSelector:sName]) {
+                id n = ((id(*)(id, SEL))objc_msgSend)(proxy, sName);
+                if ([n isKindOfClass:[NSString class]] && [n length]) name = n;
+            }
 
-            NSString *type = [proxy respondsToSelector:sType]
-                                 ? ((id(*)(id, SEL))objc_msgSend)(proxy, sType)
-                                 : @"User";
-            if ([type isKindOfClass:[NSString class]] && [type isEqualToString:@"Internal"])
-                continue;
-
+            SEL sType = NSSelectorFromString(@"applicationType");
+            if ([proxy respondsToSelector:sType]) {
+                id t = ((id(*)(id, SEL))objc_msgSend)(proxy, sType);
+                if ([t isKindOfClass:[NSString class]] && [t isEqualToString:@"Internal"]) continue;
+            }
+            SEL sHidden = NSSelectorFromString(@"isHidden");
             if ([proxy respondsToSelector:sHidden] &&
                 ((BOOL(*)(id, SEL))objc_msgSend)(proxy, sHidden))
                 continue;
+            SEL sPlace = NSSelectorFromString(@"isPlaceholder");
             if ([proxy respondsToSelector:sPlace] &&
                 ((BOOL(*)(id, SEL))objc_msgSend)(proxy, sPlace))
                 continue;
@@ -383,10 +372,50 @@ static NSArray<SGCatalogItem *> *SGLoadCatalog(void) {
     [out sortUsingComparator:^NSComparisonResult(SGCatalogItem *a, SGCatalogItem *b) {
         return [a.name localizedCaseInsensitiveCompare:b.name];
     }];
+    return out;
+}
 
-    gCachedCatalog = out;
-    SGLog(@"catalog: %lu apps", (unsigned long)out.count);
-    return gCachedCatalog;
+// Async catalog: callback always runs on the main queue.
+static void SGLoadCatalogAsync(void (^done)(NSArray<SGCatalogItem *> *)) {
+    if (gCachedCatalog) {
+        if (done) done(gCachedCatalog);
+        return;
+    }
+    if (gCatalogLoading) {           // someone else is already loading
+        if (done) done(nil);
+        return;
+    }
+    gCatalogLoading = YES;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      NSArray *cat = SGEnumerateApps();
+      gCachedCatalog = cat;
+      gCatalogLoading = NO;
+      SGLog(@"catalog: %lu apps", (unsigned long)cat.count);
+      dispatch_async(dispatch_get_main_queue(), ^{
+        if (done) done(cat);
+      });
+    });
+}
+
+// Resolve icons for a set of items off the main thread, then call back on main.
+static void SGResolveIconsAsync(NSArray<SGCatalogItem *> *items, void (^done)(void)) {
+    NSMutableArray *todo = [NSMutableArray array];
+    for (SGCatalogItem *it in items)
+        if (!it.triedIcon) [todo addObject:it];
+    if (!todo.count) {
+        if (done) done();
+        return;
+    }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+      for (SGCatalogItem *it in todo) {
+          @autoreleasepool {
+              SGResolveIcon(it);
+          }
+      }
+      dispatch_async(dispatch_get_main_queue(), ^{
+        if (done) done();
+      });
+    });
 }
 
 static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString *bid) {
@@ -394,7 +423,7 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
         if ([it.bundleID isEqualToString:bid]) return it;
     SGCatalogItem *it = [SGCatalogItem new];
     it.bundleID = bid;
-    it.name = bid;
+    it.name = bid;      // shown until the catalog arrives
     return it;
 }
 
@@ -463,8 +492,8 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
 
 #pragma mark - Launcher panel : view controller
 
-@interface SGLauncherVC : UIViewController <UITextFieldDelegate, UITableViewDataSource,
-                                            UITableViewDelegate, UIGestureRecognizerDelegate>
+@interface SGLauncherVC : UIViewController <UITableViewDataSource, UITableViewDelegate,
+                                            UIGestureRecognizerDelegate>
 @property (nonatomic, strong) UIControl *backdrop;
 @property (nonatomic, strong) UIView *sheet;
 @property (nonatomic, strong) UILabel *titleLabel;
@@ -472,13 +501,12 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
 @property (nonatomic, strong) UIButton *closeBtn;
 @property (nonatomic, strong) UIScrollView *scroll;
 @property (nonatomic, strong) UITableView *table;
-@property (nonatomic, strong) UITextField *searchField;
 @property (nonatomic, strong) UILabel *emptyLabel;
+@property (nonatomic, strong) UILabel *loadingLabel;
 @property (nonatomic, strong) NSArray<SGCatalogItem *> *catalog;
-@property (nonatomic, strong) NSArray<SGCatalogItem *> *filtered;
+@property (nonatomic, strong) NSArray<SGCatalogItem *> *catalogSections;   // picker rows
 @property (nonatomic, assign) BOOL editing;
 @property (nonatomic, assign) BOOL pickerMode;
-@property (nonatomic, copy) NSString *filter;
 - (void)showPanel;
 - (void)hidePanel;
 @end
@@ -501,15 +529,9 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
     _sheet.layer.cornerRadius = 30;
     _sheet.layer.cornerCurve = kCACornerCurveContinuous;
     _sheet.clipsToBounds = YES;
-    _sheet.backgroundColor = [UIColor colorWithWhite:0.09 alpha:0.94];
+    _sheet.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.97];
     [self.view addSubview:_sheet];
 
-    UIVisualEffectView *blur = [[UIVisualEffectView alloc]
-        initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThickMaterialDark]];
-    blur.frame = _sheet.bounds;
-    blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    blur.userInteractionEnabled = NO;
-    [_sheet addSubview:blur];
 
     _titleLabel = [[UILabel alloc] init];
     _titleLabel.text = @"应用";
@@ -546,33 +568,23 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
     _emptyLabel.hidden = YES;
     [_sheet addSubview:_emptyLabel];
 
+    _loadingLabel = [[UILabel alloc] init];
+    _loadingLabel.text = @"正在读取应用列表…";
+    _loadingLabel.textAlignment = NSTextAlignmentCenter;
+    _loadingLabel.font = [UIFont systemFontOfSize:13];
+    _loadingLabel.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
+    _loadingLabel.hidden = YES;
+    [_sheet addSubview:_loadingLabel];
+
     _table = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
     _table.backgroundColor = [UIColor clearColor];
     _table.separatorStyle = UITableViewCellSeparatorStyleNone;
     _table.dataSource = self;
     _table.delegate = self;
     _table.hidden = YES;
-    _table.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+    _table.rowHeight = 54;
+    _table.contentInset = UIEdgeInsetsMake(0, 0, 20, 0);
     [_sheet addSubview:_table];
-
-    _searchField = [[UITextField alloc] init];
-    _searchField.attributedPlaceholder = [[NSAttributedString alloc]
-        initWithString:@"搜索已安装的应用"
-            attributes:@{ NSForegroundColorAttributeName : [UIColor colorWithWhite:0.55 alpha:1.0] }];
-    _searchField.textColor = [UIColor whiteColor];
-    _searchField.font = [UIFont systemFontOfSize:14];
-    _searchField.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.10];
-    _searchField.layer.cornerRadius = 10;
-    _searchField.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 12, 1)];
-    _searchField.leftViewMode = UITextFieldViewModeAlways;
-    _searchField.clearButtonMode = UITextFieldViewModeWhileEditing;
-    _searchField.returnKeyType = UIReturnKeyDone;
-    _searchField.delegate = self;
-    _searchField.hidden = YES;
-    [_searchField addTarget:self
-                     action:@selector(searchChanged)
-           forControlEvents:UIControlEventEditingChanged];
-    [_sheet addSubview:_searchField];
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self
                                                                         action:@selector(onSheetPan:)];
@@ -592,11 +604,12 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 }
 
 - (void)layoutSheet {
+    static BOOL inLayout = NO;
+    if (inLayout) return;
+    inLayout = YES;
+    @try {
     CGSize s = self.view.bounds.size;
-    if (s.width < 10 || s.height < 10) {
-        s = [UIScreen mainScreen].bounds.size;      // window not sized yet
-        self.view.frame = CGRectMake(0, 0, s.width, s.height);
-    }
+    if (s.width < 10 || s.height < 10) s = [UIScreen mainScreen].bounds.size;
     if (s.width < 10) return;
 
     CGFloat margin = 14;
@@ -626,14 +639,17 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 
     CGFloat top = headerH;
     if (_pickerMode) {
-        _searchField.frame = CGRectMake(pad, top, w - pad * 2, 34);
-        _table.frame = CGRectMake(0, top + 40, w, contentH - top - 40);
+        _table.frame = CGRectMake(0, top, w, contentH - top);
     } else {
         _scroll.frame = CGRectMake(0, top, w, contentH - top);
     }
     _emptyLabel.frame = CGRectMake(pad, (contentH - 60) / 2, w - pad * 2, 60);
+    _loadingLabel.frame = _emptyLabel.frame;
 
     [self layoutGrid];
+    } @finally {
+        inLayout = NO;
+    }
 }
 
 - (NSArray<SGCatalogItem *> *)panelItems {
@@ -688,7 +704,8 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         } else {
             SGCatalogItem *it = items[i];
             tile.item = it;
-            tile.iconView.image = SGIconForItem(it);
+            CGFloat iconSize = MIN(tileW - 6, 60.0);
+            tile.iconView.image = SGIconQuick(it, CGSizeMake(iconSize, iconSize));
             tile.nameLabel.text = it.name ?: it.bundleID;
             tile.removeBtn.hidden = !_editing;
             [tile.removeBtn addTarget:self
@@ -700,7 +717,22 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     }
 
     _scroll.contentSize = CGSizeMake(w, 10 + rows * (tileH + 14) + 8);
-    _emptyLabel.hidden = (items.count != 0);
+    _emptyLabel.hidden = (items.count != 0) || _catalog != nil;
+
+    // upgrade placeholders to real icons off the main thread
+    NSArray *snapshot = items;
+    if (snapshot.count) {
+        __weak SGLauncherVC *weakSelf = self;
+        SGResolveIconsAsync(snapshot, ^{
+          SGLauncherVC *sself = weakSelf;
+          if (!sself || sself->_pickerMode) return;
+          for (UIView *v in sself->_scroll.subviews) {
+              if (![v isKindOfClass:[SGTile class]]) continue;
+              SGTile *t = (SGTile *)v;
+              if (t.item && t.item.icon) t.iconView.image = t.item.icon;
+          }
+        });
+    }
 }
 
 - (void)tileTapped:(SGTile *)tile {
@@ -727,7 +759,6 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     if (![sup isKindOfClass:[SGTile class]]) return;
     SGTile *tile = (SGTile *)sup;
     if (!tile.item.bundleID) return;
-
     NSString *bid = tile.item.bundleID;
     NSMutableArray *l = [gPanelApps mutableCopy];
     [l removeObject:bid];
@@ -754,66 +785,55 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 
 - (void)enterPicker {
     _pickerMode = YES;
-    [SGKeyboardOwner take];
     _scroll.hidden = YES;
     _emptyLabel.hidden = YES;
     _table.hidden = NO;
-    _searchField.hidden = NO;
-    _searchField.text = @"";
-    _filter = @"";
     _titleLabel.text = @"添加应用";
     [_editBtn setTitle:@"完成" forState:UIControlStateNormal];
-    SGInvalidateCatalog();
-    _catalog = SGLoadCatalog();
-    [self reloadFiltered];
     [self layoutSheet];
+
+    if (gCachedCatalog) {
+        _catalog = gCachedCatalog;
+        [self rebuildPickerRows];
+        _loadingLabel.hidden = YES;
+        [_table reloadData];
+        return;
+    }
+
+    _loadingLabel.hidden = NO;
+    _table.hidden = YES;
+    __weak SGLauncherVC *weakSelf = self;
+    SGLoadCatalogAsync(^(NSArray<SGCatalogItem *> *cat) {
+      SGLauncherVC *sself = weakSelf;
+      if (!sself) return;
+      sself->_catalog = cat;
+      sself->_loadingLabel.hidden = YES;
+      sself->_table.hidden = !sself->_pickerMode;
+      [sself rebuildPickerRows];
+      [sself->_table reloadData];
+      [sself layoutGrid];       // panel tiles can now show real names
+    });
 }
 
 - (void)exitPicker {
     _pickerMode = NO;
-    [SGKeyboardOwner restore];
     _scroll.hidden = NO;
     _table.hidden = YES;
-    _searchField.hidden = YES;
-    [_searchField resignFirstResponder];
+    _loadingLabel.hidden = YES;
     _titleLabel.text = @"应用";
     [_editBtn setTitle:(_editing ? @"完成" : @"编辑") forState:UIControlStateNormal];
     [self layoutSheet];
 }
 
-- (void)reloadFiltered {
-    if (!_catalog) _catalog = SGLoadCatalog();
-    NSString *f = _filter ?: @"";
+- (void)rebuildPickerRows {
     NSMutableArray *out = [NSMutableArray array];
-    for (SGCatalogItem *it in _catalog) {
-        if ([gPanelApps containsObject:it.bundleID]) continue;
-        if (f.length) {
-            BOOL hit = [it.name rangeOfString:f options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                       [it.bundleID rangeOfString:f options:NSCaseInsensitiveSearch].location != NSNotFound;
-            if (!hit) continue;
-        }
-        [out addObject:it];
-    }
-    _filtered = out;
-    [_table reloadData];
-}
-
-- (void)searchChanged {
-    _filter = _searchField.text ?: @"";
-    [self reloadFiltered];
-}
-
-- (BOOL)textFieldShouldReturn:(UITextField *)tf {
-    [tf resignFirstResponder];
-    return YES;
+    for (SGCatalogItem *it in _catalog)
+        if (![gPanelApps containsObject:it.bundleID]) [out addObject:it];
+    _catalogSections = out;
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    return _filtered.count;
-}
-
-- (CGFloat)tableView:(UITableView *)tv heightForRowAtIndexPath:(NSIndexPath *)ip {
-    return 54;
+    return _catalogSections.count;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
@@ -831,19 +851,24 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         cell.imageView.layer.cornerCurve = kCACornerCurveContinuous;
         cell.imageView.clipsToBounds = YES;
     }
-    if (ip.row < (NSInteger)_filtered.count) {
-        SGCatalogItem *it = _filtered[ip.row];
+    if (ip.row < (NSInteger)_catalogSections.count) {
+        SGCatalogItem *it = _catalogSections[ip.row];
         cell.textLabel.text = it.name;
         cell.detailTextLabel.text = it.bundleID;
-        cell.imageView.image = SGIconForItem(it);
+        cell.imageView.image = SGIconQuick(it, CGSizeMake(38, 38));
+        __weak UITableViewCell *wcell = cell;
+        __weak SGLauncherVC *weakSelf = self;
+        SGResolveIconsAsync(@[ it ], ^{
+          if (weakSelf && wcell && it.icon) wcell.imageView.image = it.icon;
+        });
     }
     return cell;
 }
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
-    if (ip.row >= (NSInteger)_filtered.count) return;
-    SGCatalogItem *it = _filtered[ip.row];
+    if (ip.row >= (NSInteger)_catalogSections.count) return;
+    SGCatalogItem *it = _catalogSections[ip.row];
     if (![gPanelApps containsObject:it.bundleID]) {
         NSMutableArray *l = [gPanelApps mutableCopy];
         [l addObject:it.bundleID];
@@ -852,7 +877,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         SGPanelVibrate();
     }
     [self exitPicker];
-    [self reloadFiltered];
+    [self rebuildPickerRows];
 }
 
 #pragma mark lifecycle
@@ -891,17 +916,29 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     _pickerMode = NO;
     _scroll.hidden = NO;
     _table.hidden = YES;
-    _searchField.hidden = YES;
+    _loadingLabel.hidden = YES;
     _titleLabel.text = @"应用";
     [_editBtn setTitle:@"编辑" forState:UIControlStateNormal];
-
-    SGInvalidateCatalog();
-    _catalog = SGLoadCatalog();
     [self layoutSheet];
+
+    // Catalog already cached? use it. Otherwise show tiles by bundle id and fill
+    // in names/icons when the background scan finishes.
+    if (gCachedCatalog) {
+        _catalog = gCachedCatalog;
+        [self layoutSheet];
+    } else {
+        __weak SGLauncherVC *weakSelf = self;
+        SGLoadCatalogAsync(^(NSArray<SGCatalogItem *> *cat) {
+          SGLauncherVC *sself = weakSelf;
+          if (!sself || !cat || sself->_pickerMode) return;
+          sself->_catalog = cat;
+          [sself layoutSheet];
+        });
+    }
 
     _backdrop.alpha = 0;
     _sheet.transform = CGAffineTransformMakeTranslation(0, _sheet.bounds.size.height + 40);
-    [UIView animateWithDuration:0.32
+    [UIView animateWithDuration:0.30
                           delay:0
          usingSpringWithDamping:0.92
           initialSpringVelocity:0.6
@@ -914,56 +951,28 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 }
 
 - (void)hidePanel {
-    [self.view endEditing:YES];
-    [SGKeyboardOwner restore];
-    [UIView animateWithDuration:0.2
+    // Stop accepting touches at once, so a half-animated panel can never eat input.
+    self.view.userInteractionEnabled = NO;
+    __weak SGLauncherVC *weakSelf = self;
+    [UIView animateWithDuration:0.18
         animations:^{
-          self->_sheet.transform =
-              CGAffineTransformMakeTranslation(0, self->_sheet.bounds.size.height + 40);
-          self->_backdrop.alpha = 0;
+          SGLauncherVC *s = weakSelf;
+          if (!s) return;
+          s->_sheet.transform =
+              CGAffineTransformMakeTranslation(0, s->_sheet.bounds.size.height + 40);
+          s->_backdrop.alpha = 0;
         }
         completion:^(BOOL f) {
-          SGLauncherHide();
+          SGLauncherHide();     // sync when already on main
         }];
 }
 
 @end
 
-#pragma mark - Launcher panel : key window ownership
-
-@implementation SGKeyboardOwner
-+ (void)take {
-    if (!gPanelWindow || gPanelWindow.isKeyWindow) return;
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        if (w.isKeyWindow && w.windowLevel < 4000) {
-            gPanelPrevKey = w;
-            break;
-        }
-    }
-    [gPanelWindow makeKeyWindow];
-}
-+ (void)restore {
-    UIWindow *back = gPanelPrevKey;
-    gPanelPrevKey = nil;
-    if (!back || back.hidden || back == gPanelWindow) return;
-    [back makeKeyWindow];
-}
-@end
-
-
 #pragma mark - Launcher panel : SpringBoard host window
 
-static UIWindow *SBCurrentKeyWindow(void) {
-    for (UIWindow *w in [UIApplication sharedApplication].windows)
-        if (w.isKeyWindow && w.windowLevel < 4000) return w;
-    return nil;
-}
-
 static UIWindowScene *SGPickScene(void) {
-    // 1) scene captured while SpringBoard created / keyed its own windows
     if (gCachedScene) return gCachedScene;
-
-    // 2) any connected scene in this process
     @try {
         UIWindowScene *any = nil;
         for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
@@ -975,15 +984,11 @@ static UIWindowScene *SGPickScene(void) {
         if (any) return any;
     } @catch (__unused NSException *e) {
     }
-
-    // 3) the scene of any live window
     @try {
         for (UIWindow *w in [UIApplication sharedApplication].windows)
             if (w.windowScene) return w.windowScene;
     } @catch (__unused NSException *e) {
     }
-
-    // 4) SpringBoard's own private accessors
     Class sbClass = objc_getClass("SpringBoard");
     if (sbClass) {
         SEL sh = NSSelectorFromString(@"sharedInstance");
@@ -999,8 +1004,6 @@ static UIWindowScene *SGPickScene(void) {
             }
         }
     }
-
-    // 5) SBWindowScene's current scene, via the scene manager
     Class smClass = objc_getClass("SBSceneManager");
     if (smClass) {
         SEL sh = NSSelectorFromString(@"sharedInstance");
@@ -1037,27 +1040,29 @@ static UIWindow *SGMakePanelWindow(void) {
 
     if (!win.windowScene && scene) {
         SEL s2 = NSSelectorFromString(@"_setWindowScene:");
-        if ([win respondsToSelector:s2])
-            ((void(*)(id, SEL, id))objc_msgSend)(win, s2, scene);
+        if ([win respondsToSelector:s2]) ((void(*)(id, SEL, id))objc_msgSend)(win, s2, scene);
     }
 
     win.frame = [UIScreen mainScreen].bounds;
     win.windowLevel = 5000.0;
     win.backgroundColor = [UIColor clearColor];
     win.hidden = YES;
-    SGLog(@"panel window: scene=%@ level=%.1f frame=%@",
-          win.windowScene ? NSStringFromClass([win.windowScene class]) : @"NIL",
-          (double)win.windowLevel, NSStringFromCGRect(win.frame));
+    // IMPORTANT: never let the panel window join SpringBoard's key-window
+    // tracking. Taking key status from inside SpringBoard deadlocks the main
+    // thread, which is what froze the device in 1.4.0.
+    win.rootViewController = nil;
+    SGLog(@"panel window: scene=%@ level=%.1f", win.windowScene ? @"yes" : @"NIL",
+          (double)win.windowLevel);
     return win;
 }
 
 static void SGLauncherShow(void) {
     SGLog(@"SGLauncherShow enter isSpringBoard=%d enabled=%d", isSpringBoard(), gPanelEnabled);
-    if (!isSpringBoard()) { SGLog(@"SGLauncherShow: not SpringBoard -> abort"); return; }
-    if (!gPanelEnabled) { SGLog(@"SGLauncherShow: PanelEnabled=NO -> abort"); return; }
+    if (!isSpringBoard()) return;
+    if (!gPanelEnabled) return;
     dispatch_async(dispatch_get_main_queue(), ^{
       if (gPanelWindow && !gPanelWindow.hidden) {
-          [gPanelVC hidePanel];   // toggle off
+          [gPanelVC hidePanel];
           return;
       }
       if (!gPanelWindow) {
@@ -1073,56 +1078,38 @@ static void SGLauncherShow(void) {
           }
       }
       if (!gPanelWindow) { SGLog(@"no panel window -> abort"); return; }
-      // Deliberately not makeKeyAndVisible: the frontmost app keeps keyboard focus
-      // and text input. SGKeyboardOwner takes key status only for the search field.
+
       if (gPanelWindow.rootViewController != gPanelVC) gPanelWindow.rootViewController = gPanelVC;
       gPanelWindow.frame = [UIScreen mainScreen].bounds;
-      // A plain `hidden = NO` is not enough for a window created inside SpringBoard:
-      // it has to become key at least once or it never gets composited.
-      // We restore the previous key window on hide.
-      if (!gPanelPrevKey) {
-          for (UIWindow *w in [UIApplication sharedApplication].windows)
-              if (w.isKeyWindow && w.windowLevel < 4000) { gPanelPrevKey = w; break; }
-      }
+      gPanelVC.view.frame = gPanelWindow.bounds;
+
+      // Just unhide. Do NOT call makeKeyWindow / makeKeyAndVisible here:
+      // stealing key status inside SpringBoard blocks the main thread.
+      gPanelVC.view.userInteractionEnabled = YES;
       gPanelWindow.hidden = NO;
       gPanelWindow.alpha = 1.0;
-      [gPanelWindow makeKeyAndVisible];
-      gPanelVC.view.frame = gPanelWindow.bounds;
-      [gPanelVC.view setNeedsLayout];
-      [gPanelVC.view layoutIfNeeded];
+
       [gPanelVC showPanel];
-      SGLog(@"panel shown win=%@ level=%.1f scene=%@ vcView=%@ hidden=%d",
-            NSStringFromCGRect(gPanelWindow.frame), (double)gPanelWindow.windowLevel,
-            gPanelWindow.windowScene ? @"yes" : @"NO", NSStringFromCGRect(gPanelVC.view.frame),
+      SGLog(@"panel shown level=%.1f vcView=%@ hidden=%d",
+            (double)gPanelWindow.windowLevel, NSStringFromCGRect(gPanelVC.view.frame),
             gPanelWindow.hidden);
     });
 }
 
+static void SGLauncherHideNow(void) {
+    if (!gPanelWindow) return;
+    gPanelWindow.hidden = YES;
+    gPanelWindow.alpha = 1.0;
+    gPanelVC.view.alpha = 1.0;
+    gPanelVC.view.transform = CGAffineTransformIdentity;
+    gPanelVC.view.userInteractionEnabled = NO;
+    SGLog(@"panel hidden (sync)");
+}
+
 static void SGLauncherHide(void) {
     if (!isSpringBoard()) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-      gPanelWindow.hidden = YES;
-      gPanelVC.view.alpha = 0;
-      gPanelVC.view.transform = CGAffineTransformIdentity;
-      UIWindow *back = SBCurrentKeyWindow();
-      if (back && back != gPanelWindow && !back.hidden) {
-          [back makeKeyWindow];
-      } else {
-          Class sbClass = NSClassFromString(@"SpringBoard");
-          if (sbClass) {
-              SEL sh = NSSelectorFromString(@"sharedInstance");
-              if ([sbClass respondsToSelector:sh]) {
-                  id sb = ((id(*)(id, SEL))objc_msgSend)(sbClass, sh);
-                  SEL mkw = NSSelectorFromString(@"_keyWindow");
-                  if (sb && [sb respondsToSelector:mkw]) {
-                      UIWindow *kw = ((id(*)(id, SEL))objc_msgSend)(sb, mkw);
-                      if (kw && kw != gPanelWindow) [kw makeKeyWindow];
-                  }
-              }
-          }
-      }
-      SGLog(@"panel hidden");
-    });
+    if ([NSThread isMainThread]) { SGLauncherHideNow(); return; }
+    dispatch_async(dispatch_get_main_queue(), ^{ SGLauncherHideNow(); });
 }
 
 #pragma mark - SpringBoard-side executors (run inside SpringBoard)
@@ -1146,55 +1133,22 @@ static void sbHome(void) {
 }
 
 static void sbLock(void) {
-    SGLog(@"sbLock enter");
-    // PRIMARY: backlight fade-out == the hardware lock button's path
-    //   SBBacklightController _startFadeOutAnimationFromLockSource:
-    //     -> screenSleepCoordinator sleepAndLockUIFromSource:
-    // This both locks AND physically turns the display off.
-    // (v1.2/v1.4 used SBLockDevice(port,1), which locks but leaves the screen
-    //  lit -- reported as "lock works but screen never goes dark".)
-    Class blc = objc_getClass("SBBacklightController");
-    if (blc) {
-        id bl = ((id(*)(id, SEL))objc_msgSend)(blc, NSSelectorFromString(@"sharedInstance"));
-        SEL fade = NSSelectorFromString(@"_startFadeOutAnimationFromLockSource:");
-        SGLog(@"sbLock: bl=%p fade=%d", bl, bl && [bl respondsToSelector:fade]);
-        if (bl && [bl respondsToSelector:fade]) {
-            ((void(*)(id, SEL, int))objc_msgSend)(bl, fade, 11);
-            return;
-        }
+    mach_port_t p = gGetPort ? gGetPort() : 0;
+    SGLog(@"sbLock: port=%u lock=%p dim=%p", p, gLockDevice, gDimScreen);
+    if (p && gLockDevice) {
+        gLockDevice(p, 1);   // exactly what Apple's DMDLockUtilities does
+        if (gDimScreen) gDimScreen(p, 1);
+        return;
     }
-
-    // SECONDARY: lock screen manager with the exact options the system
-    // lock button builds (ForceLockKey + LockAutomatically, source 11).
-    Class lsmc = objc_getClass("SBLockScreenManager");
-    if (lsmc) {
-        id inst = ((id(*)(id, SEL))objc_msgSend)(lsmc, NSSelectorFromString(@"sharedInstance"));
+    // Fallback chain
+    Class c = objc_getClass("SBLockScreenManager");
+    if (c) {
+        id inst = ((id(*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"sharedInstance"));
         SEL sel = NSSelectorFromString(@"lockUIFromSource:withOptions:");
         if (inst && [inst respondsToSelector:sel]) {
-            NSDictionary *opts = @{
-                @"SBUILockOptionsForceLockKey"         : @YES,
-                @"SBUILockOptionsLockAutomaticallyKey" : @YES,
-            };
-            SGLog(@"sbLock: lockUIFromSource:11");
-            ((void(*)(id, SEL, int, id))objc_msgSend)(inst, sel, 11, opts);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                Class b2c = objc_getClass("SBBacklightController");
-                id b2 = ((id(*)(id, SEL))objc_msgSend)(b2c, NSSelectorFromString(@"sharedInstance"));
-                SEL f2 = NSSelectorFromString(@"_startFadeOutAnimationFromLockSource:");
-                if (b2 && [b2 respondsToSelector:f2])
-                    ((void(*)(id, SEL, int))objc_msgSend)(b2, f2, 11);
-            });
-            return;
+            SGLog(@"sbLock: SBS lockUIFromSource fallback");
+            ((void(*)(id, SEL, long, id))objc_msgSend)(inst, sel, 0, nil);
         }
-    }
-
-    // LAST RESORT: C API (locks, may not dim)
-    mach_port_t p = gGetPort ? gGetPort() : 0;
-    SGLog(@"sbLock: C fallback port=%u lock=%p dim=%p", p, gLockDevice, gDimScreen);
-    if (p && gLockDevice) {
-        gLockDevice(p, 1);
-        if (gDimScreen) gDimScreen(p, 1);
     }
 }
 
@@ -1231,11 +1185,12 @@ static void actionNotifyCb(CFNotificationCenterRef c, void *o, CFStringRef n,
             vibrate(); sbLock();
         } else if (CFStringCompare(n, CFSTR(kNotifySwitcher), 0) == kCFCompareEqualTo) {
             vibrate(); sbSwitcher();
-        } else if (CFStringCompare(n, CFSTR(kNotifyScreenshot), 0) == kCFCompareEqualTo) {
-            sbScreenshotAndSave();   // app side already vibrated + flashed
         } else if (CFStringCompare(n, CFSTR(kNotifyHome), 0) == kCFCompareEqualTo) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ sbHome(); });
+        } else if (CFStringCompare(n, CFSTR(kNotifyHide), 0) == kCFCompareEqualTo) {
+            SGLog(@"force hide received");
+            SGLauncherHide();
         } else if (CFStringCompare(n, CFSTR(kNotifyPanel), 0) == kCFCompareEqualTo ||
                    CFStringCompare(n, CFSTR(kNotifyTest), 0) == kCFCompareEqualTo) {
             SGLog(@"panel notify received (%@)",
@@ -1286,6 +1241,10 @@ static void doLock(void) {
 }
 
 static void doPanel(void) {
+    static NSTimeInterval lastFire = 0;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - lastFire < 0.8) { SGLog(@"doPanel debounced"); return; }
+    lastFire = now;
     SGLog(@"doPanel isSpringBoard=%d panelEnabled=%d", isSpringBoard(), gPanelEnabled);
     SGPanelVibrate();
     if (isSpringBoard()) {
@@ -1302,49 +1261,21 @@ static void doSwitcher(void) {
     notify_post(kNotifySwitcher);
 }
 
-// Walk UP the controller hierarchy (and through children) to find any
-// UINavigationController with something to pop. QQ's chat screen keeps its nav
-// controller deeper than topVC, which is why the plain property lookup failed.
-static UINavigationController *findNav(UIViewController *vc, int depth) {
-    if (!vc || depth > 8) return nil;
-    if ([vc isKindOfClass:[UINavigationController class]]) {
-        UINavigationController *n = (UINavigationController *)vc;
-        if (n.viewControllers.count > 1) return n;
-    }
-    if ([vc isKindOfClass:[UITabBarController class]]) {
-        UINavigationController *n =
-            findNav([(UITabBarController *)vc selectedViewController], depth + 1);
-        if (n) return n;
-    }
-    for (UIViewController *c in vc.childViewControllers) {
-        UINavigationController *n = findNav(c, depth + 1);
-        if (n) return n;
-    }
-    UINavigationController *n = findNav(vc.parentViewController, depth + 1);
-    if (n) return n;
-    if (vc.presentingViewController)
-        n = findNav(vc.presentingViewController, depth + 1);
-    return n;
-}
-
 static void doBack(void) {
     vibrate();
-    UINavigationController *nav = findNav(topVC(), 0);
+    UIViewController *vc = topVC();
+    if (!vc) return;
+    UINavigationController *nav = vc.navigationController;
     if (!nav) {
         UIWindow *win = [UIApplication sharedApplication].keyWindow;
-        nav = findNav(win.rootViewController, 0);
+        UIViewController *root = win ? win.rootViewController : nil;
+        if ([root isKindOfClass:[UITabBarController class]]) {
+            UIViewController *sel = [(UITabBarController *)root selectedViewController];
+            if ([sel isKindOfClass:[UINavigationController class]])
+                nav = (UINavigationController *)sel;
+        }
     }
-    SGLog(@"doBack nav=%p stack=%lu", nav, (unsigned long)nav.viewControllers.count);
-    if (nav && nav.viewControllers.count > 1) {
-        [nav popViewControllerAnimated:YES];
-        return;
-    }
-    // No nav stack: dismiss a modally presented controller instead.
-    UIViewController *top = topVC();
-    if (top && top.presentingViewController) {
-        [top dismissViewControllerAnimated:YES completion:nil];
-        SGLog(@"doBack dismissed modal");
-    }
+    if (nav && nav.viewControllers.count > 1) [nav popViewControllerAnimated:YES];
 }
 
 // Crash-proof screenshot flash overlay
@@ -1355,8 +1286,7 @@ static void showFlash(void) {
     w.alpha = 1.0;
     w.userInteractionEnabled = NO;
     w.rootViewController = [[UIViewController alloc] init];
-    // NOT makeKeyAndVisible: stealing key status broke later gestures.
-    w.hidden = NO;
+    [w makeKeyAndVisible];
     [UIView animateWithDuration:0.28 animations:^{
         w.alpha = 0.0;
     } completion:^(BOOL finished) {
@@ -1364,48 +1294,52 @@ static void showFlash(void) {
     }];
 }
 
-static void sbScreenshotAndSave(void) {
-    // Runs INSIDE SpringBoard: compositing every window here captures the
-    // status bar and system UI too, which an app-process render cannot see.
-    CGRect scr = [UIScreen mainScreen].bounds;
-    SGLog(@"sbShot size=%.0fx%.0f", scr.size.width, scr.size.height);
-    UIGraphicsImageRenderer *r =
-        [[UIGraphicsImageRenderer alloc] initWithSize:scr.size];
-    UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (w.hidden || w.alpha <= 0.01) continue;
-            CGContextSaveGState(ctx.CGContext);
-            CGContextTranslateCTM(ctx.CGContext, w.frame.origin.x, w.frame.origin.y);
-            [w.layer renderInContext:ctx.CGContext];
-            CGContextRestoreGState(ctx.CGContext);
-        }
-    }];
-    if (!img) { SGLog(@"sbShot render failed"); return; }
-
-    PHAuthorizationStatus st =
-        [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
-    SGLog(@"sbShot photoAuth=%ld", (long)st);
-    if (st == PHAuthorizationStatusAuthorized || st == PHAuthorizationStatusLimited) {
-        UIImageWriteToSavedPhotosAlbum(img, nil, nil, nil);
-        SGLog(@"sbShot saved to album");
-    } else {
-        NSString *path = [NSTemporaryDirectory()
-            stringByAppendingPathComponent:@"SquidGesture.png"];
-        BOOL ok = [UIImagePNGRepresentation(img) writeToFile:path atomically:YES];
-        SGLog(@"sbShot tmp=%d %@", ok, path);
-    }
-}
-
 static void doScreenshot(void) {
     vibrate();
     SGLog(@"doScreenshot: isSpringBoard=%d", isSpringBoard());
-    showFlash();
-    if (isSpringBoard()) {
-        sbScreenshotAndSave();
-    } else {
-        // Ask SpringBoard to capture the full screen (all layers).
-        notify_post(kNotifyScreenshot);
-    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *window = nil;
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.windowLevel == UIWindowLevelNormal && w.bounds.size.width > 0) {
+                window = w; break;
+            }
+        }
+        if (!window) window = [UIApplication sharedApplication].keyWindow;
+        if (!window) { SGLog(@"doScreenshot: no window"); return; }
+        SGLog(@"doScreenshot: window=%@ size=%@", window, NSStringFromCGRect(window.bounds));
+
+        UIGraphicsImageRenderer *r =
+            [[UIGraphicsImageRenderer alloc] initWithSize:window.bounds.size];
+        UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+            [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:YES];
+        }];
+        if (!img) { SGLog(@"doScreenshot: render failed"); return; }
+        SGLog(@"doScreenshot: img=%@", NSStringFromCGSize(img.size));
+        showFlash();
+
+        PHAuthorizationStatus st =
+            [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
+        SGLog(@"doScreenshot: photoAuth=%ld", (long)st);
+
+        if (st == PHAuthorizationStatusAuthorized || st == PHAuthorizationStatusLimited) {
+            UIImageWriteToSavedPhotosAlbum(img, nil, nil, nil);
+            SGLog(@"doScreenshot: saved to album");
+        } else {
+            NSString *path = [NSTemporaryDirectory()
+                stringByAppendingPathComponent:@"SquidGesture.png"];
+            BOOL ok = [UIImagePNGRepresentation(img) writeToFile:path atomically:YES];
+            SGLog(@"doScreenshot: wrote tmp=%d path=%@", ok, path);
+            NSURL *url = [NSURL fileURLWithPath:path];
+            UIActivityViewController *avc = [[UIActivityViewController alloc]
+                initWithActivityItems:@[url] applicationActivities:nil];
+            UIViewController *top = topVC();
+            if (top) {
+                if (avc.popoverPresentationController)
+                    avc.popoverPresentationController.sourceView = top.view;
+                [top presentViewController:avc animated:YES completion:nil];
+            }
+        }
+    });
 }
 
 #pragma mark - Gesture Handler
@@ -1416,7 +1350,6 @@ static void doScreenshot(void) {
 @end
 
 static char kAttachedKey;
-static NSTimeInterval gLastCornerAction = 0;
 static char kPanelPanKey;
 
 @implementation SGHandler
@@ -1544,29 +1477,11 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 
 - (void)onCornerTap:(UITapGestureRecognizer *)g {
     if (!gEnabled) return;
-
-    // Classify in SCREEN coordinates. g.view.bounds is the coordinate space of
-    // whichever window received the touch -- with recognizers on every window
-    // (needed for QQ) a top-right tap on a narrow overlay window tested as
-    // top-left, so BOTH corners ran the lock action.
-    CGPoint winPt = [g locationInView:g.view];
-    UIWindow *w = g.view.window;
-    CGPoint sp = w ? [w convertPoint:winPt toWindow:nil] : winPt;
-    CGRect scr = [UIScreen mainScreen].bounds;
-
-    BOOL topLeft  = sp.x < gCornerSize && sp.y < gCornerSize;
-    BOOL topRight = sp.x > scr.size.width - gCornerSize && sp.y < gCornerSize;
-    SGLog(@"cornerTap screen=(%.0f,%.0f) win=(%.0f,%.0f) scr=%.0fx%.0f L=%d R=%d",
-          sp.x, sp.y, winPt.x, winPt.y, scr.size.width, scr.size.height,
-          topLeft, topRight);
-    if (!topLeft && !topRight) return;
-
-    // Several windows may each report the same physical tap: debounce only
-    // when an action is about to fire.
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - gLastCornerAction < 0.6) { SGLog(@"cornerTap debounced"); return; }
-    gLastCornerAction = now;
-
+    CGPoint loc = [g locationInView:g.view];
+    CGRect b = g.view.bounds;
+    BOOL topLeft  = loc.x < gCornerSize && loc.y < gCornerSize;
+    BOOL topRight = loc.x > b.size.width - gCornerSize && loc.y < gCornerSize;
+    SGLog(@"cornerTap at %.0f,%.0f L=%d R=%d", loc.x, loc.y, topLeft, topRight);
     if (topLeft && gCornerTapLock) doLock();
     else if (topRight && gCornerTapScreenshot) doScreenshot();
 }
@@ -1637,13 +1552,13 @@ static void attachAllWindows(void) {
             CFSTR(kNotifySwitcher), NULL, CFNotificationSuspensionBehaviorCoalesce);
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
-            CFSTR(kNotifyScreenshot), NULL, CFNotificationSuspensionBehaviorCoalesce);
-        CFNotificationCenterAddObserver(
-            CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
             CFSTR(kNotifyPanel), NULL, CFNotificationSuspensionBehaviorCoalesce);
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
             CFSTR(kNotifyTest), NULL, CFNotificationSuspensionBehaviorCoalesce);
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
+            CFSTR(kNotifyHide), NULL, CFNotificationSuspensionBehaviorCoalesce);
     }
 
     // Attach immediately + polled re-attach (covers windows created later,

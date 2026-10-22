@@ -1,6 +1,6 @@
 # SquidGesture
 
-系统级手势插件（rootless / Dopamine 已验证）。v1.4.0 修复**右下角上划应用面板**。
+系统级手势插件（rootless / Dopamine 已验证）。v1.5.0 修复**右下角上划应用面板**。
 
 ## 手势列表
 
@@ -16,7 +16,7 @@
 
 所有手势触发时振动反馈。
 
-## 应用面板（v1.4.0 修复）
+## 应用面板（v1.5.0 修复）
 
 - 从**屏幕右下角**（默认 130×210pt 的角框内）向上滑动，弹出毛玻璃面板。
 - 面板是 4 列图标网格，底栏最后一个是 **＋**：
@@ -66,8 +66,11 @@ notify_post com.minis.squidgesture.prefs-changed
 `/var/mobile/Library/Preferences/com.minis.squidgesture.log`
 
 ```bash
-# 不碰屏幕，直接从终端开面板（判断"手势没识别"还是"面板没渲染"）
+# 从终端开面板，不用碰屏幕（区分"手势没识别"和"面板没渲染"）
 notify_post com.minis.squidgesture.test.panel
+
+# 面板卡住时，强制关闭（不重启 SpringBoard）
+notify_post com.minis.squidgesture.test.hide
 
 tail -50 /var/mobile/Library/Preferences/com.minis.squidgesture.log
 ```
@@ -79,7 +82,7 @@ tail -50 /var/mobile/Library/Preferences/com.minis.squidgesture.log
 ## 安装
 
 ```bash
-dpkg -i com.minis.squidgesture_1.4.0_iphoneos-arm64.deb
+dpkg -i com.minis.squidgesture_1.5.0_iphoneos-arm64.deb
 # 或 sileo / zebra 直接装
 ```
 
@@ -93,6 +96,7 @@ dpkg -i com.minis.squidgesture_1.4.0_iphoneos-arm64.deb
 | 右下角上划无面板 | 先 `notify_post com.minis.squidgesture.test.panel`：面板出现=手势问题，不出现=渲染问题 |
 | 日志里没有 `panelPan` | 手势没进插件：确认 filter 含 `com.apple.springboard`，且 dylib 是 arm64e |
 | 日志有 `panelPan` 无 `panel notify` | 手势判定没通过（看 `up=` / `vert=` 值） |
+| 面板卡住/点不了 | 用 `notify_post com.minis.squidgesture.test.hide` 强制关闭 |
 | 面板空白 | 目录加载失败，看日志；或重启 SpringBoard 再试 |
 | 点图标不启动 | 日志里应有 `launch xxx -> ok/no` |
 
