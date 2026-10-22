@@ -1,9 +1,14 @@
-// SquidGesture.x — System-wide gesture control tweak v1.1.0
-// Two-stage architecture:
-//   - App process: detect gestures -> Darwin notify
-//   - SpringBoard: listen -> execute actions via private APIs directly
-// (SpringBoardServices SBSSpringBoardServerPortHome/LockDevice/ShowAppSwitcher
-//  were REMOVED in iOS 16 — dlsym returned NULL, actions silently skipped.)
+// SquidGesture.x — System-wide gesture control tweak v1.2.0
+// Fixes over v1.1.0:
+//  1. Lock: use SBLockDevice(port,1) — the exact call Apple's own MDM
+//     framework (DMDLockUtilities) uses. Symbol verified in iPhoneOS16.5.tbd.
+//     (v1.1 tried SBLockScreenManager lockUIFromSource: which does nothing for
+//      a plain lock request.)
+//  2. Screenshot: force a visible flash + write a debug log so silent failures
+//     become diagnosable; keep permission-aware save + share fallback.
+//  3. QQ: attach gestures to ALL windows (QQ puts touch handling on its own
+//     high-level windows, not the key window), and hook makeKeyWindow/
+//     makeKeyAndVisible/becomeKeyWindow.
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -26,9 +31,29 @@ static BOOL gCornerTapScreenshot = YES;
 static BOOL gThreeFingerHome = YES;
 static BOOL gThreeFingerSwitcher = YES;
 static BOOL gVibrationFeedback = YES;
+static BOOL gDebugLog = NO;
 
 static NSString *const kPrefsFile =
     @"/var/mobile/Library/Preferences/com.minis.squidgesture.plist";
+static NSString *const kLogFile =
+    @"/var/mobile/Library/Preferences/com.minis.squidgesture.log";
+
+static void SGLog(NSString *fmt, ...) {
+    if (!gDebugLog) return;
+    va_list ap; va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
+                      [NSDate date], s];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kLogFile];
+    if (fh) {
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } else {
+        [line writeToFile:kLogFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+}
 
 static void loadPrefs(void) {
     NSDictionary *p = [NSDictionary dictionaryWithContentsOfFile:kPrefsFile];
@@ -43,6 +68,7 @@ static void loadPrefs(void) {
     LOAD("ThreeFingerHome", gThreeFingerHome, boolValue);
     LOAD("ThreeFingerSwitcher", gThreeFingerSwitcher, boolValue);
     LOAD("VibrationFeedback", gVibrationFeedback, boolValue);
+    LOAD("DebugLog", gDebugLog, boolValue);
 #undef LOAD
 }
 
@@ -54,27 +80,34 @@ static void prefsChangedCb(CFNotificationCenterRef c, void *o, CFStringRef n,
 #pragma mark - Process detection
 
 static BOOL isSpringBoard(void) {
-    NSProcessInfo *pi = [NSProcessInfo processInfo];
-    NSString *name = [pi processName] ?: @"";
+    NSString *name = [[NSProcessInfo processInfo] processName] ?: @"";
     return [name isEqualToString:@"SpringBoard"];
 }
 
-#pragma mark - SpringBoardServices (symbols verified in iOS 16.5 tbd)
+#pragma mark - SpringBoardServices (all symbols verified in iPhoneOS16.5.tbd)
 
 typedef mach_port_t (*PortFunc)(void);
 typedef void (*SuspendFunc)(mach_port_t);
+typedef void (*LockFunc)(mach_port_t, int);
+typedef void (*DimFunc)(mach_port_t, int);
 
 static PortFunc gGetPort = NULL;
 static SuspendFunc gSuspendFrontmost = NULL;
+static LockFunc gLockDevice = NULL;
+static DimFunc gDimScreen = NULL;
 
 static void initSBS(void) {
     void *h = dlopen(
         "/System/Library/PrivateFrameworks/SpringBoardServices.framework/"
-        "SpringBoardServices",
-        RTLD_LAZY);
-    if (!h) return;
-    gGetPort = (PortFunc)dlsym(h, "SBSSpringBoardServerPort");
+        "SpringBoardServices", RTLD_LAZY);
+    if (!h) { SGLog(@"SBS dlopen failed"); return; }
+    gGetPort        = (PortFunc)dlsym(h, "SBSSpringBoardServerPort");
     gSuspendFrontmost = (SuspendFunc)dlsym(h, "SBSSuspendFrontmostApplication");
+    // Apple's own MDM (DMDLockUtilities) does: SBLockDevice(port, 1)
+    gLockDevice     = (LockFunc)dlsym(h, "SBLockDevice");
+    gDimScreen      = (DimFunc)dlsym(h, "SBDimScreen");
+    SGLog(@"SBS symbols port=%p suspend=%p lock=%p dim=%p",
+          gGetPort, gSuspendFrontmost, gLockDevice, gDimScreen);
 }
 
 #pragma mark - Darwin actions
@@ -87,31 +120,48 @@ static void vibrate(void) {
     if (gVibrationFeedback) AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
 }
 
-#pragma mark - SpringBoard-side executors (run in SpringBoard process)
+#pragma mark - SpringBoard-side executors (run inside SpringBoard)
 
 static void sbHome(void) {
-    // Suspend frontmost app == home button press equivalent
+    SGLog(@"sbHome: suspend=%p port=%p", gSuspendFrontmost, gGetPort);
     if (gSuspendFrontmost && gGetPort) {
         mach_port_t p = gGetPort();
-        if (p) gSuspendFrontmost(p);
+        if (p) { gSuspendFrontmost(p); return; }
+    }
+    SGLog(@"sbHome: no symbol -> fallback");
+    Class c = objc_getClass("SBUIController");
+    if (c) {
+        id inst = ((id(*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"sharedInstance"));
+        SEL sel = NSSelectorFromString(@"handleHomeButtonSinglePressUpForWindowScene:");
+        SEL alt = NSSelectorFromString(@"handleHomeButtonDoublePressDown");
+        if (inst && [inst respondsToSelector:alt])
+            ((BOOL(*)(id, SEL))objc_msgSend)(inst, alt);
+        (void)sel;
     }
 }
 
 static void sbLock(void) {
+    mach_port_t p = gGetPort ? gGetPort() : 0;
+    SGLog(@"sbLock: port=%u lock=%p dim=%p", p, gLockDevice, gDimScreen);
+    if (p && gLockDevice) {
+        gLockDevice(p, 1);   // exactly what Apple's DMDLockUtilities does
+        if (gDimScreen) gDimScreen(p, 1);
+        return;
+    }
+    // Fallback chain
     Class c = objc_getClass("SBLockScreenManager");
     if (c) {
         id inst = ((id(*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"sharedInstance"));
-        if (!inst) inst = ((id(*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"sharedInstanceIfExists"));
-        SEL lockSel = NSSelectorFromString(@"lockUIFromSource:withOptions:");
-        if (inst && [inst respondsToSelector:lockSel]) {
-            ((void(*)(id, SEL, long, id))objc_msgSend)(inst, lockSel, 0, nil);
-            return;
+        SEL sel = NSSelectorFromString(@"lockUIFromSource:withOptions:");
+        if (inst && [inst respondsToSelector:sel]) {
+            SGLog(@"sbLock: SBS lockUIFromSource fallback");
+            ((void(*)(id, SEL, long, id))objc_msgSend)(inst, sel, 0, nil);
         }
     }
 }
 
 static void sbSwitcher(void) {
-    // Way 1: SBUIController home-button double press (system path)
+    SGLog(@"sbSwitcher");
     Class c = objc_getClass("SBUIController");
     if (c) {
         id inst = ((id(*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"sharedInstance"));
@@ -121,45 +171,43 @@ static void sbSwitcher(void) {
             return;
         }
     }
-    // Way 2: SBMainSwitcherControllerCoordinator toggle
     Class coord = objc_getClass("SBMainSwitcherControllerCoordinator");
     if (coord) {
-        SEL shimSel = NSSelectorFromString(@"_shim_activeSwitcherController");
         id sc = nil;
-        if ([coord respondsToSelector:shimSel])
-            sc = ((id(*)(id, SEL))objc_msgSend)(coord, shimSel);
+        SEL shim = NSSelectorFromString(@"_shim_activeSwitcherController");
+        if ([coord respondsToSelector:shim])
+            sc = ((id(*)(id, SEL))objc_msgSend)(coord, shim);
         else
             sc = ((id(*)(id, SEL))objc_msgSend)(coord, NSSelectorFromString(@"sharedInstance"));
-        SEL toggleSel = NSSelectorFromString(@"toggleMainSwitcherWithSource:animated:");
-        if (sc && [sc respondsToSelector:toggleSel]) {
-            ((void(*)(id, SEL, long, BOOL))objc_msgSend)(sc, toggleSel, 20, YES);
-            return;
+        SEL toggle = NSSelectorFromString(@"toggleMainSwitcherWithSource:animated:");
+        if (sc && [sc respondsToSelector:toggle]) {
+            ((void(*)(id, SEL, long, BOOL))objc_msgSend)(sc, toggle, 20, YES);
         }
     }
 }
 
-// Darwin notification callback (SpringBoard only)
 static void actionNotifyCb(CFNotificationCenterRef c, void *o, CFStringRef n,
                            const void *obj, CFDictionaryRef ui) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (CFStringCompare(n, CFSTR(kNotifyLock), 0) == kCFCompareEqualTo) {
-            vibrate();
-            sbLock();
+            vibrate(); sbLock();
         } else if (CFStringCompare(n, CFSTR(kNotifySwitcher), 0) == kCFCompareEqualTo) {
-            vibrate();
-            sbSwitcher();
+            vibrate(); sbSwitcher();
         } else if (CFStringCompare(n, CFSTR(kNotifyHome), 0) == kCFCompareEqualTo) {
-            // App already suspended itself; this is the safety net
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ sbHome(); });
         }
     });
 }
 
-#pragma mark - App-side actions (run in normal app process)
+#pragma mark - App-side actions
 
 static UIViewController *topVC(void) {
     UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    if (!win) {
+        for (UIWindow *w in [UIApplication sharedApplication].windows)
+            if (w.isKeyWindow) { win = w; break; }
+    }
     if (!win) return nil;
     UIViewController *vc = win.rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
@@ -179,26 +227,22 @@ static void appSuspendSelf(void) {
 
 static void doHome(void) {
     vibrate();
-    if (isSpringBoard()) {
-        sbHome();
-        return;
-    }
-    // Primary: suspend current app (== home button, process-local, no sandbox issue)
+    if (isSpringBoard()) { sbHome(); return; }
     appSuspendSelf();
-    // Safety net: ask SpringBoard to suspend frontmost app too
     notify_post(kNotifyHome);
 }
 
 static void doLock(void) {
     vibrate();
-    if (isSpringBoard()) sbLock();
-    else notify_post(kNotifyLock);
+    SGLog(@"doLock: isSpringBoard=%d", isSpringBoard());
+    if (isSpringBoard()) { sbLock(); return; }
+    notify_post(kNotifyLock);
 }
 
 static void doSwitcher(void) {
     vibrate();
-    if (isSpringBoard()) sbSwitcher();
-    else notify_post(kNotifySwitcher);
+    if (isSpringBoard()) { sbSwitcher(); return; }
+    notify_post(kNotifySwitcher);
 }
 
 static void doBack(void) {
@@ -215,40 +259,63 @@ static void doBack(void) {
                 nav = (UINavigationController *)sel;
         }
     }
-    if (nav && nav.viewControllers.count > 1) {
-        [nav popViewControllerAnimated:YES];
-    }
-    // No nav stack -> nothing to go back to
+    if (nav && nav.viewControllers.count > 1) [nav popViewControllerAnimated:YES];
+}
+
+// Crash-proof screenshot flash overlay
+static void showFlash(void) {
+    UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    w.windowLevel = UIWindowLevelAlert + 100;
+    w.backgroundColor = [UIColor whiteColor];
+    w.alpha = 1.0;
+    w.userInteractionEnabled = NO;
+    w.rootViewController = [[UIViewController alloc] init];
+    [w makeKeyAndVisible];
+    [UIView animateWithDuration:0.28 animations:^{
+        w.alpha = 0.0;
+    } completion:^(BOOL finished) {
+        w.hidden = YES;
+    }];
 }
 
 static void doScreenshot(void) {
     vibrate();
+    SGLog(@"doScreenshot: isSpringBoard=%d", isSpringBoard());
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *window = nil;
         for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (w.windowLevel == UIWindowLevelNormal) { window = w; break; }
+            if (w.windowLevel == UIWindowLevelNormal && w.bounds.size.width > 0) {
+                window = w; break;
+            }
         }
         if (!window) window = [UIApplication sharedApplication].keyWindow;
-        if (!window) return;
+        if (!window) { SGLog(@"doScreenshot: no window"); return; }
+        SGLog(@"doScreenshot: window=%@ size=%@", window, NSStringFromCGRect(window.bounds));
 
         UIGraphicsImageRenderer *r =
             [[UIGraphicsImageRenderer alloc] initWithSize:window.bounds.size];
         UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
             [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:YES];
         }];
-        if (!img) return;
+        if (!img) { SGLog(@"doScreenshot: render failed"); return; }
+        SGLog(@"doScreenshot: img=%@", NSStringFromCGSize(img.size));
+        showFlash();
 
-        // Permission-aware save: silent fail/crash risks otherwise
-        PHAuthorizationStatus st = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
+        PHAuthorizationStatus st =
+            [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
+        SGLog(@"doScreenshot: photoAuth=%ld", (long)st);
+
         if (st == PHAuthorizationStatusAuthorized || st == PHAuthorizationStatusLimited) {
             UIImageWriteToSavedPhotosAlbum(img, nil, nil, nil);
+            SGLog(@"doScreenshot: saved to album");
         } else {
-            // Fallback: temporary file + share sheet
-            NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"SquidGesture.png"];
-            [UIImagePNGRepresentation(img) writeToFile:path atomically:YES];
+            NSString *path = [NSTemporaryDirectory()
+                stringByAppendingPathComponent:@"SquidGesture.png"];
+            BOOL ok = [UIImagePNGRepresentation(img) writeToFile:path atomically:YES];
+            SGLog(@"doScreenshot: wrote tmp=%d path=%@", ok, path);
             NSURL *url = [NSURL fileURLWithPath:path];
-            UIActivityViewController *avc =
-                [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+            UIActivityViewController *avc = [[UIActivityViewController alloc]
+                initWithActivityItems:@[url] applicationActivities:nil];
             UIViewController *top = topVC();
             if (top) {
                 if (avc.popoverPresentationController)
@@ -282,55 +349,56 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     return YES;
 }
 
+// Let taps/swipes fall through to app UI too (non-destructive)
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
+       shouldRequireFailureOfGestureRecognizer:(UIGestureRecognizer *)other {
+    return NO;
+}
+
 - (void)attachToWindow:(UIWindow *)window {
+    if (!window) return;
     if (objc_getAssociatedObject(window, &kAttachedKey)) return;
     objc_setAssociatedObject(window, &kAttachedKey, @YES,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    SGLog(@"attach to window %@ level=%.1f", NSStringFromClass([window class]),
+          (double)window.windowLevel);
 
     if (gLeftEdgeBack) {
         UIScreenEdgePanGestureRecognizer *g =
             [[UIScreenEdgePanGestureRecognizer alloc]
                 initWithTarget:self action:@selector(onLeftPan:)];
-        g.edges = UIRectEdgeLeft;
-        g.delegate = self;
+        g.edges = UIRectEdgeLeft; g.delegate = self;
         [window addGestureRecognizer:g];
     }
-
     if (gRightEdgeSwitcher) {
         UIScreenEdgePanGestureRecognizer *g =
             [[UIScreenEdgePanGestureRecognizer alloc]
                 initWithTarget:self action:@selector(onRightPan:)];
-        g.edges = UIRectEdgeRight;
-        g.delegate = self;
+        g.edges = UIRectEdgeRight; g.delegate = self;
         [window addGestureRecognizer:g];
     }
-
     if (gCornerTapLock || gCornerTapScreenshot) {
         UITapGestureRecognizer *g =
-            [[UITapGestureRecognizer alloc]
-                initWithTarget:self action:@selector(onCornerTap:)];
-        g.numberOfTapsRequired = 2;
-        g.delegate = self;
+            [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                    action:@selector(onCornerTap:)];
+        g.numberOfTapsRequired = 2; g.delegate = self;
+        g.cancelsTouchesInView = NO;   // don't eat app taps
         [window addGestureRecognizer:g];
     }
-
     if (gThreeFingerHome) {
         UISwipeGestureRecognizer *g =
-            [[UISwipeGestureRecognizer alloc]
-                initWithTarget:self action:@selector(onThreeFingerUp:)];
+            [[UISwipeGestureRecognizer alloc] initWithTarget:self
+                                                      action:@selector(onThreeFingerUp:)];
         g.direction = UISwipeGestureRecognizerDirectionUp;
-        g.numberOfTouchesRequired = 3;
-        g.delegate = self;
+        g.numberOfTouchesRequired = 3; g.delegate = self;
         [window addGestureRecognizer:g];
     }
-
     if (gThreeFingerSwitcher) {
         UISwipeGestureRecognizer *g =
-            [[UISwipeGestureRecognizer alloc]
-                initWithTarget:self action:@selector(onThreeFingerDown:)];
+            [[UISwipeGestureRecognizer alloc] initWithTarget:self
+                                                      action:@selector(onThreeFingerDown:)];
         g.direction = UISwipeGestureRecognizerDirectionDown;
-        g.numberOfTouchesRequired = 3;
-        g.delegate = self;
+        g.numberOfTouchesRequired = 3; g.delegate = self;
         [window addGestureRecognizer:g];
     }
 }
@@ -349,8 +417,9 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     if (!gEnabled) return;
     CGPoint loc = [g locationInView:g.view];
     CGRect b = g.view.bounds;
-    BOOL topLeft = loc.x < gCornerSize && loc.y < gCornerSize;
+    BOOL topLeft  = loc.x < gCornerSize && loc.y < gCornerSize;
     BOOL topRight = loc.x > b.size.width - gCornerSize && loc.y < gCornerSize;
+    SGLog(@"cornerTap at %.0f,%.0f L=%d R=%d", loc.x, loc.y, topLeft, topRight);
     if (topLeft && gCornerTapLock) doLock();
     else if (topRight && gCornerTapScreenshot) doScreenshot();
 }
@@ -374,41 +443,62 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     %orig;
     if (gEnabled) [[SGHandler shared] attachToWindow:self];
 }
+- (void)makeKeyWindow {
+    %orig;
+    if (gEnabled) [[SGHandler shared] attachToWindow:self];
+}
+- (void)makeKeyAndVisible {
+    %orig;
+    if (gEnabled) [[SGHandler shared] attachToWindow:self];
+}
 %end
 
 #pragma mark - Constructor
+
+static void attachAllWindows(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    for (UIWindow *w in app.windows) {
+        [[SGHandler shared] attachToWindow:w];
+    }
+    UIWindow *key = app.keyWindow;
+    if (key) [[SGHandler shared] attachToWindow:key];
+}
 
 %ctor {
     loadPrefs();
     initSBS();
 
-    // Preferences reload
     CFNotificationCenterAddObserver(
-        CFNotificationCenterGetDarwinNotifyCenter(),
-        NULL, prefsChangedCb,
-        CFSTR("com.minis.squidgesture.prefs-changed"),
-        NULL, CFNotificationSuspensionBehaviorCoalesce);
+        CFNotificationCenterGetDarwinNotifyCenter(), NULL, prefsChangedCb,
+        CFSTR("com.minis.squidgesture.prefs-changed"), NULL,
+        CFNotificationSuspensionBehaviorCoalesce);
 
-    // Action executor listeners — SpringBoard process only
     if (isSpringBoard()) {
         CFNotificationCenterAddObserver(
-            CFNotificationCenterGetDarwinNotifyCenter(),
-            NULL, actionNotifyCb,
+            CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
             CFSTR(kNotifyHome), NULL, CFNotificationSuspensionBehaviorCoalesce);
         CFNotificationCenterAddObserver(
-            CFNotificationCenterGetDarwinNotifyCenter(),
-            NULL, actionNotifyCb,
+            CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
             CFSTR(kNotifyLock), NULL, CFNotificationSuspensionBehaviorCoalesce);
         CFNotificationCenterAddObserver(
-            CFNotificationCenterGetDarwinNotifyCenter(),
-            NULL, actionNotifyCb,
+            CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
             CFSTR(kNotifySwitcher), NULL, CFNotificationSuspensionBehaviorCoalesce);
     }
 
-    // Attach gestures to existing key window
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        UIWindow *w = [UIApplication sharedApplication].keyWindow;
-        if (w) [[SGHandler shared] attachToWindow:w];
-    });
+    // Attach immediately + polled re-attach (covers windows created later,
+    // e.g. QQ's own overlay windows that never become key).
+    attachAllWindows();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ attachAllWindows(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ attachAllWindows(); });
+
+    // Periodic sweep for late-created windows
+    dispatch_source_t timer = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(timer,
+        dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+        10 * NSEC_PER_SEC, 2 * NSEC_PER_SEC);
+    dispatch_source_set_event_handler(timer, ^{ attachAllWindows(); });
+    dispatch_resume(timer);
 }

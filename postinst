@@ -33,6 +33,7 @@ if [ ! -f "$PREFS" ]; then
     <key>ThreeFingerHome</key><true/>
     <key>ThreeFingerSwitcher</key><true/>
     <key>VibrationFeedback</key><true/>
+    <key>DebugLog</key><true/>
 </dict>
 </plist>
 PLISTEOF
