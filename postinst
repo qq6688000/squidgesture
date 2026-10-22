@@ -1,0 +1,55 @@
+#!/bin/sh
+set -e
+
+JB=/var/jb
+[ -d "$JB" ] || JB=""
+
+DYLIB="$JB/Library/MobileSubstrate/DynamicLibraries/SquidGesture.dylib"
+PLIST="$JB/Library/MobileSubstrate/DynamicLibraries/SquidGesture.plist"
+TI="$JB/usr/lib/TweakInject"
+
+chmod 755 "$DYLIB" 2>/dev/null || true
+
+if [ -d "$TI" ] && [ -f "$DYLIB" ] && [ ! -e "$TI/SquidGesture.dylib" ]; then
+    ln -sf "$DYLIB" "$TI/SquidGesture.dylib" 2>/dev/null || true
+    ln -sf "$PLIST" "$TI/SquidGesture.plist" 2>/dev/null || true
+fi
+
+# Write default preferences if no existing config
+PREFS="/var/mobile/Library/Preferences/com.minis.squidgesture.plist"
+if [ ! -f "$PREFS" ]; then
+    mkdir -p "$(dirname "$PREFS")"
+    cat > "$PREFS" <<'PLISTEOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Enabled</key><true/>
+    <key>CornerSize</key><real>80</real>
+    <key>LeftEdgeBack</key><true/>
+    <key>RightEdgeSwitcher</key><true/>
+    <key>CornerTapLock</key><true/>
+    <key>CornerTapScreenshot</key><true/>
+    <key>ThreeFingerHome</key><true/>
+    <key>ThreeFingerSwitcher</key><true/>
+    <key>VibrationFeedback</key><true/>
+</dict>
+</plist>
+PLISTEOF
+    chown mobile:mobile "$PREFS" 2>/dev/null || true
+fi
+
+killall -9 SpringBoard 2>/dev/null || true
+
+echo "SquidGesture installed (all gestures enabled by default)."
+echo ""
+echo "Gestures:"
+echo "  Left edge swipe     -> Back (pop navigation)"
+echo "  Right edge swipe    -> App Switcher"
+echo "  Top-left  2x tap    -> Lock screen"
+echo "  Top-right 2x tap    -> Screenshot"
+echo "  3-finger swipe up   -> Home"
+echo "  3-finger swipe down -> App Switcher"
+echo ""
+echo "Settings: /var/mobile/Library/Preferences/com.minis.squidgesture.plist"
+exit 0
