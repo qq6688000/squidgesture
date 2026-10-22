@@ -145,10 +145,9 @@ static void actionBack(void) {
     }
     if (nav && nav.viewControllers.count > 1) {
         // System interactive pop may also fire — just let it
-        // Only pop if not already transitioning
-        if (!nav.isTransitioning) [nav popViewControllerAnimated:YES];
+        [nav popViewControllerAnimated:YES];
     }
-    // No nav stack → do nothing (or go home)
+    // No nav stack → do nothing
 }
 
 #pragma mark - Gesture Handler
