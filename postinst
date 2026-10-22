@@ -15,7 +15,7 @@ if [ -d "$TI" ] && [ -f "$DYLIB" ] && [ ! -e "$TI/SquidGesture.dylib" ]; then
     ln -sf "$PLIST" "$TI/SquidGesture.plist" 2>/dev/null || true
 fi
 
-# Write default preferences if no existing config
+# Write default preferences, keeping any existing user config untouched
 PREFS="/var/mobile/Library/Preferences/com.minis.squidgesture.plist"
 if [ ! -f "$PREFS" ]; then
     mkdir -p "$(dirname "$PREFS")"
@@ -33,7 +33,17 @@ if [ ! -f "$PREFS" ]; then
     <key>ThreeFingerHome</key><true/>
     <key>ThreeFingerSwitcher</key><true/>
     <key>VibrationFeedback</key><true/>
-    <key>DebugLog</key><true/>
+    <key>PanelEnabled</key><true/>
+    <key>PanelVibrate</key><true/>
+    <key>PanelApps</key>
+    <array>
+        <string>com.apple.MobileSMS</string>
+        <string>com.apple.mobilesafari</string>
+        <string>com.apple.camera</string>
+        <string>com.apple.mobiletimer</string>
+        <string>com.apple.mobilenotes</string>
+        <string>com.apple.calculator</string>
+    </array>
 </dict>
 </plist>
 PLISTEOF
@@ -42,15 +52,12 @@ fi
 
 killall -9 SpringBoard 2>/dev/null || true
 
-echo "SquidGesture installed (all gestures enabled by default)."
+echo "SquidGesture 1.3.0 installed."
 echo ""
-echo "Gestures:"
-echo "  Left edge swipe     -> Back (pop navigation)"
-echo "  Right edge swipe    -> App Switcher"
-echo "  Top-left  2x tap    -> Lock screen"
-echo "  Top-right 2x tap    -> Screenshot"
-echo "  3-finger swipe up   -> Home"
-echo "  3-finger swipe down -> App Switcher"
+echo "  Swipe up from the BOTTOM-RIGHT corner -> app panel (+ to add apps)"
+echo "  Left edge swipe    -> Back        Right edge swipe -> App switcher"
+echo "  Top-left 2x tap    -> Lock        Top-right 2x tap -> Screenshot"
+echo "  3-finger up        -> Home        3-finger down    -> App switcher"
 echo ""
-echo "Settings: /var/mobile/Library/Preferences/com.minis.squidgesture.plist"
+echo "Config: /var/mobile/Library/Preferences/com.minis.squidgesture.plist"
 exit 0

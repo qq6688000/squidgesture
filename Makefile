@@ -6,7 +6,8 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = SquidGesture
 
 SquidGesture_FILES = Tweak.x
-SquidGesture_FRAMEWORKS = UIKit AudioToolbox Photos
-SquidGesture_CFLAGS = -fobjc-arc -Wno-unguarded-availability-new -Wno-deprecated-declarations
+SquidGesture_FRAMEWORKS = UIKit AudioToolbox Photos QuartzCore
+SquidGesture_CFLAGS = -fobjc-arc -Wno-unguarded-availability-new -Wno-deprecated-declarations -Wno-nullability-completeness
+SquidGesture_LDFLAGS = -Wl,-rpath,/var/jb/Library/Frameworks -Wl,-rpath,/var/jb/usr/lib
 
 include $(THEOS_MAKE_PATH)/tweak.mk
