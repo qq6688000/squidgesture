@@ -1735,8 +1735,6 @@ static CGRect SGHomeBarRect(void) {
     // within PanelSwipeAboveBar points just above it) and in its right half,
     // running out to the screen edge. Nothing is measured from the screen edge,
     // so the zone lines up with the bar the user actually sees on any device.
-    CGFloat boxW      = MIN(MAX(gPanelBarWidth, 120.0), 280.0);
-    CGFloat tolerance = MIN(MAX(gPanelBarTolerance, 0.0), 60.0);
 
     // Everything below is derived from the black bar's own rect - nothing is
     // measured from the screen edge. The handsets put that bar ~134x5pt,
@@ -1756,7 +1754,6 @@ static CGRect SGHomeBarRect(void) {
     CGFloat zoneBottom = screen.height;
     CGFloat zoneLeft   = CGRectGetMinX(bar) - 40.0;            // whole bar + slack
     CGFloat zoneRight  = screen.width;                          // out to the edge
-    (void)boxW;
 
     BOOL inCorner = (sp.x >= zoneLeft) && (sp.x <= zoneRight) &&
                     (sp.y >= zoneTop)  && (sp.y <= zoneBottom);
