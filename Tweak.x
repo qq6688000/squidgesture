@@ -1398,6 +1398,7 @@ static void doScreenshot(void) {
 
 static char kAttachedKey;
 static char kPanelPanKey;
+static char kRightEdgeKey;
 
 @implementation SGHandler
 
@@ -1441,6 +1442,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
             [[UIScreenEdgePanGestureRecognizer alloc]
                 initWithTarget:self action:@selector(onRightPan:)];
         g.edges = UIRectEdgeRight; g.delegate = self;
+        objc_setAssociatedObject(g, &kRightEdgeKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [window addGestureRecognizer:g];
     }
     if (gCornerTapLock || gCornerTapScreenshot) {
@@ -1483,33 +1485,65 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 }
 
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
-    if (!objc_getAssociatedObject(g, &kPanelPanKey)) return YES;
     UIView *v = g.view;
-    if (!v) return NO;
+    if (!v) return YES;
+
+    // Screen-space corner box shared by the panel swipe and the right-edge
+    // switcher, so the two can never fight over the same swipe.
     CGPoint p = [g locationInView:v];
-    CGSize s = v.bounds.size;
-    // Start anywhere in the lower-right region - NOT only on the extreme bottom
-    // edge, because that is exactly where the system home-swipe grabs the touch.
-    CGFloat boxW = MAX(gCornerSize * 2.4, 190.0);
-    CGFloat boxH = MAX(gCornerSize * 4.0, 380.0);
-    BOOL inBox = (p.x > s.width - boxW) && (p.y > s.height - boxH);
-    SGLog(@"panelPan begin %.0f,%.0f box %.0fx%.0f -> %d", p.x, p.y, boxW, boxH, inBox);
-    return inBox;
+    UIWindow *win = v.window;
+    CGPoint sp = (win ? [win convertPoint:p toWindow:nil] : p);
+    CGSize screen = [UIScreen mainScreen].bounds.size;
+    CGFloat boxW = MAX(gCornerSize * 2.2, 185.0);
+    CGFloat boxH = MAX(gCornerSize * 3.4, 330.0);
+    BOOL inCorner = (sp.x > screen.width - boxW) && (sp.y > screen.height - boxH);
+
+    // The bottom-right corner belongs to the launcher panel. Without this the
+    // right-edge recognizer wins (the corner IS the right edge) and opens the
+    // app switcher instead - exactly what the log showed.
+    if (objc_getAssociatedObject(g, &kRightEdgeKey)) {
+        if (inCorner && gPanelEnabled) {
+            SGLog(@"rightEdge vetoed in panel corner");
+            return NO;
+        }
+        return YES;
+    }
+
+    if (!objc_getAssociatedObject(g, &kPanelPanKey)) return YES;
+    SGLog(@"panelPan begin %.0f,%.0f box %.0fx%.0f -> %d", sp.x, sp.y, boxW, boxH, inCorner);
+    return inCorner;
 }
 
 - (void)onPanelPan:(UIPanGestureRecognizer *)g {
     if (!gEnabled || !gPanelEnabled) return;
+
+    static BOOL fired = NO;
     UIGestureRecognizerState st = g.state;
-    // Cancelled counts: the system home gesture often takes over mid-swipe.
-    if (st != UIGestureRecognizerStateEnded && st != UIGestureRecognizerStateCancelled) return;
+    if (st == UIGestureRecognizerStateBegan) {
+        fired = NO;
+        return;
+    }
+    if (st != UIGestureRecognizerStateChanged && st != UIGestureRecognizerStateEnded &&
+        st != UIGestureRecognizerStateCancelled)
+        return;
+    if (fired) return;
 
     CGPoint t = [g translationInView:g.view];
     CGPoint vel = [g velocityInView:g.view];
-    BOOL upward = (t.y < -45 || vel.y < -500);
-    BOOL vertical = fabs(t.y) > fabs(t.x) * 1.1;
+
+    // Fire as early as possible. The log showed the system home gesture
+    // cancelling our pan at ~40pt of travel, so waiting for -55 meant the
+    // panel almost never opened. 25pt (or a quick flick) beats that window.
+    BOOL upward = (t.y <= -25) || (vel.y <= -260);
+    BOOL vertical = (fabs(t.y) >= fabs(t.x) * 0.85) ||
+                    (fabs(vel.y) >= fabs(vel.x) * 0.9 && fabs(vel.y) > 200);
     SGLog(@"panelPan state=%ld t=%.0f,%.0f v=%.0f up=%d vert=%d",
           (long)st, t.x, t.y, vel.y, upward, vertical);
-    if (upward && vertical) doPanel();
+
+    if (upward && vertical) {
+        fired = YES;          // latch: one swipe opens the panel once
+        doPanel();
+    }
 }
 
 - (void)onLeftPan:(UIScreenEdgePanGestureRecognizer *)g {
