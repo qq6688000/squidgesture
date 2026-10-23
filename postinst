@@ -10,13 +10,19 @@ TI="$JB/usr/lib/TweakInject"
 
 chmod 755 "$DYLIB" 2>/dev/null || true
 
-# Same as the working 1.5.9 layout: the real file lives in DynamicLibraries
-# and TweakInject gets a symlink to it.  Always recreate the link (rm first)
-# so a stale real file from an older build can never shadow it.
+# Mirror into TweakInject only when it is a DIFFERENT directory.
+#
+# On this device TweakInject resolves to the same directory as
+# DynamicLibraries.  `ln -sf X X` in that case creates a self-referential
+# symlink that destroys the real dylib - that is exactly what happened.
 if [ -d "$TI" ] && [ -f "$DYLIB" ]; then
-    rm -f "$TI/SquidGesture.dylib" "$TI/SquidGesture.plist" 2>/dev/null || true
-    ln -sf "$DYLIB"  "$TI/SquidGesture.dylib" 2>/dev/null || true
-    ln -sf "$PLIST"  "$TI/SquidGesture.plist" 2>/dev/null || true
+    DLDIR=$(cd "$(dirname "$DYLIB")" && pwd -P 2>/dev/null)
+    TIDIR=$(cd "$TI" && pwd -P 2>/dev/null)
+    if [ -n "$DLDIR" ] && [ -n "$TIDIR" ] && [ "$DLDIR" != "$TIDIR" ]; then
+        rm -f "$TI/SquidGesture.dylib" "$TI/SquidGesture.plist" 2>/dev/null || true
+        ln -sf "$DYLIB" "$TI/SquidGesture.dylib" 2>/dev/null || true
+        ln -sf "$PLIST" "$TI/SquidGesture.plist" 2>/dev/null || true
+    fi
 fi
 
 # Write default preferences, keeping any existing user config untouched
@@ -60,7 +66,7 @@ fi
 
 killall -9 SpringBoard 2>/dev/null || true
 
-echo "SquidGesture 1.5.9r installed."
+echo "SquidGesture 1.5.9s installed."
 echo ""
 echo "  Swipe UP starting on the black home bar -> app panel (+ to add apps)"
 echo "  Top-left 2x tap -> Lock    Top-right 2x tap -> Screenshot"

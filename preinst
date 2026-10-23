@@ -1,11 +1,11 @@
 #!/bin/sh
 # preinst: runs BEFORE dpkg unpacks files.
 #
-# The device had a self-referential symlink:
+# The device ended up with a self-referential symlink:
 #   DynamicLibraries/SquidGesture.dylib -> .../DynamicLibraries/SquidGesture.dylib
-# dpkg refuses to write through it, so every install since 1.7.3 failed
-# silently and dpkg -l stayed at 1.7.2.  Remove any symlink (or stale real
-# file) at both managed paths so dpkg can create clean real files.
+# which destroyed the real dylib and made every install a no-op.  Remove any
+# symlink at the managed paths (never a regular file - dpkg overwrites those
+# fine) so dpkg can write clean real files.
 JB=/var/jb
 [ -d "$JB" ] || JB=""
 
@@ -16,10 +16,7 @@ for d in "$DL" "$TI"; do
     [ -d "$d" ] || continue
     for f in SquidGesture.dylib SquidGesture.plist; do
         p="$d/$f"
-        if [ -L "$p" ]; then
-            # a symlink: drop it, dpkg will write the real file
-            rm -f "$p" 2>/dev/null || true
-        fi
+        [ -L "$p" ] && rm -f "$p" 2>/dev/null
     done
 done
 exit 0
