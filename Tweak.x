@@ -1631,8 +1631,14 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         [window addGestureRecognizer:g];
     }
     if (gPanelEnabled) {
-        SGPanelPan *g = [[SGPanelPan alloc] initWithTarget:self
-                                                    action:@selector(onPanelPan:)];
+        // v1.6.6: a real system right-edge recogniser, exactly like the
+        // "swipe from the right edge" gesture every iOS app already knows.
+        // It only claims the outermost few points of the screen, so it cannot
+        // interfere with anything happening inside the app.
+        UIScreenEdgePanGestureRecognizer *g =
+            [[UIScreenEdgePanGestureRecognizer alloc] initWithTarget:self
+                                                              action:@selector(onPanelPan:)];
+        g.edges = UIRectEdgeRight;
         g.minimumNumberOfTouches = 1;
         g.maximumNumberOfTouches = 1;
         g.cancelsTouchesInView = NO;
@@ -1653,26 +1659,17 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     if (!objc_getAssociatedObject(g, &kPanelPanKey)) return YES;
     if (!gPanelEnabled) return NO;
 
-    // v1.6.6: the panel is opened by swiping LEFT from the right screen edge.
-    // The old bottom-right upward strip is gone - making SpringBoard's home
-    // gesture wait for ours killed every touch on the device.
-    //
-    // Use the touch-down point: this callback fires after ~10pt of travel.
     CGPoint p = [g locationInView:v];
-    SGPanelPan *pp = [g isKindOfClass:[SGPanelPan class]] ? (SGPanelPan *)g : nil;
-    if (pp && pp.hasStart) p = pp.startPoint;
     UIWindow *win = v.window;
     CGPoint sp = (win ? [win convertPoint:p toWindow:nil] : p);
 
     CGSize scr = [UIScreen mainScreen].bounds.size;
-    CGFloat edgeW = 30.0;                       // touch must start within this
-    CGFloat top   = scr.height * 0.12;          // keep clear of Control Centre
-    CGFloat bot   = scr.height * 0.88;
+    CGFloat top = scr.height * 0.12;            // keep clear of Control Centre
+    CGFloat bot = scr.height * 0.88;
 
-    BOOL inZone = (sp.x >= scr.width - edgeW) && (sp.y >= top) && (sp.y <= bot);
-    SGLog(@"panelEdge begin %.0f,%.0f%@ zone x[%.0f..%.0f] y[%.0f..%.0f] -> %d",
-          sp.x, sp.y, (pp && pp.hasStart) ? @"(touch-down)" : @"(current)",
-          scr.width - edgeW, scr.width, top, bot, inZone);
+    BOOL inZone = (sp.y >= top) && (sp.y <= bot);
+    SGLog(@"panelEdge begin %.0f,%.0f x[%.0f..%.0f] y[%.0f..%.0f] -> %d",
+          sp.x, sp.y, scr.width - 30.0, scr.width, top, bot, inZone);
     return inZone;
 }
 
