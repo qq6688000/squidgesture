@@ -11,6 +11,7 @@
 //     makeKeyAndVisible/becomeKeyWindow.
 
 #import <unistd.h>
+#import <sys/wait.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -1279,70 +1280,195 @@ static void sbHome(void) {
 }
 
 static void sbLock(void) {
+    SGLog(@"sbLock enter");
+
+    // 1) iOS 15-17: the lock screen manager is still the owner of locking.
+    //    -lockUIFromSource:withOptions: is gone on 17; the modern entry points
+    //    are -lockScreenViewController / -lockUIFromSource: and, most reliably,
+    //    -lockDeviceAnimated: on SBLockScreenManager.
+    Class lm = objc_getClass("SBLockScreenManager");
+    if (lm) {
+        id inst = ((id(*)(id, SEL))objc_msgSend)(lm, NSSelectorFromString(@"sharedInstance"));
+        if (inst) {
+            NSString *const sels[] = {
+                @"lockDeviceAnimated:", @"lockUIFromSource:", @"lockScreenViewController"
+            };
+            const char *types[] = { "v@:B", "v@:q", "@@:" };
+            for (int i = 0; i < 3; i++) {
+                SEL sel = NSSelectorFromString(sels[i]);
+                if (![inst respondsToSelector:sel]) continue;
+                @try {
+                    if (i == 0) {
+                        ((void(*)(id, SEL, BOOL))objc_msgSend)(inst, sel, YES);
+                    } else if (i == 1) {
+                        ((void(*)(id, SEL, long))objc_msgSend)(inst, sel, 0);
+                    } else {
+                        ((id(*)(id, SEL))objc_msgSend)(inst, sel);
+                    }
+                    SGLog(@"sbLock: SBLockScreenManager %@ OK", sels[i]);
+                    return;
+                } @catch (NSException *e) {
+                    SGLog(@"sbLock: %@ threw %@", sels[i], e.reason);
+                }
+            }
+            (void)types;
+        }
+        SGLog(@"sbLock: SBLockScreenManager without a usable selector");
+    }
+
+    // 2) SBLockDevice via SpringBoardServices (works on <=16)
     mach_port_t p = gGetPort ? gGetPort() : 0;
-    SGLog(@"sbLock: port=%u lock=%p dim=%p", p, gLockDevice, gDimScreen);
     if (p && gLockDevice) {
-        gLockDevice(p, 1);   // exactly what Apple's DMDLockUtilities does
+        gLockDevice(p, 1);
         if (gDimScreen) gDimScreen(p, 1);
+        SGLog(@"sbLock: SBLockDevice OK");
         return;
     }
-    // Fallback chain
-    Class c = objc_getClass("SBLockScreenManager");
-    if (c) {
-        id inst = ((id(*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"sharedInstance"));
-        SEL sel = NSSelectorFromString(@"lockUIFromSource:withOptions:");
-        if (inst && [inst respondsToSelector:sel]) {
-            SGLog(@"sbLock: SBS lockUIFromSource fallback");
-            ((void(*)(id, SEL, long, id))objc_msgSend)(inst, sel, 0, nil);
+
+    // 3) The private SpringBoard "hardware button" path - same thing the
+    //    physical side button triggers, so it works on every iOS version.
+    Class hb = objc_getClass("SBLockHardwareButton");
+    if (!hb) hb = objc_getClass("SBHardwareButtonCoordinator");
+    if (hb) {
+        id inst = nil;
+        SEL sh = NSSelectorFromString(@"sharedInstance");
+        if ([hb respondsToSelector:sh])
+            inst = ((id(*)(id, SEL))objc_msgSend)(hb, sh);
+        if (!inst && [hb respondsToSelector:NSSelectorFromString(@"new")])
+            inst = ((id(*)(id, SEL))objc_msgSend)(hb, NSSelectorFromString(@"new"));
+        for (NSString *n in @[ @"performLockButtonDown", @"lockButtonDown" ]) {
+            SEL sel = NSSelectorFromString(n);
+            if (inst && [inst respondsToSelector:sel]) {
+                ((void(*)(id, SEL))objc_msgSend)(inst, sel);
+                SGLog(@"sbLock: %@ -%@ OK", NSStringFromClass(hb), n);
+                return;
+            }
         }
     }
+
+    SGLog(@"sbLock: all paths failed");
 }
 
 // 2.1.0: power menu (log out / restart) for the left half of the status bar.
 // SpringBoard already owns this UI, so ask it to present it rather than
 // building our own - that keeps the icons, sliders and confirmations correct.
 static void sbPowerMenu(void) {
-    SGLog(@"sbPowerMenu");
+    SGLog(@"sbPowerMenu enter");
 
-    // 1) SBUIController -presentPowerDownUI (iOS 12 and earlier, still present)
-    Class c = objc_getClass("SBUIController");
-    if (c) {
-        id inst = ((id(*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"sharedInstance"));
-        SEL s1 = NSSelectorFromString(@"presentPowerDownUI");
-        SEL s2 = NSSelectorFromString(@"handlePowerButtonPress");
-        if (inst && [inst respondsToSelector:s1]) {
-            SGLog(@"sbPowerMenu: SBUIController -presentPowerDownUI");
-            ((void(*)(id, SEL))objc_msgSend)(inst, s1);
-            return;
+    // iOS 16/17 renamed the power UI.  Try every known owner in order and log
+    // which class actually answered, so the next build can be trimmed to it.
+    // SBPowerDownController is the actual owner of the power-off UI on
+    // iOS 13-17; `-activate` presents it.  Put it first.
+    NSArray *classes = @[ @"SBPowerDownController",
+                          @"SBPowerDownViewController",
+                          @"SBUIController",
+                          @"SBLockHardwareButton",
+                          @"SBHardwareButtonCoordinator",
+                          @"SBLockScreenManager" ];
+    NSArray *sels = @[ @"activate",
+                       @"present",
+                       @"presentPowerDownUI",
+                       @"showPowerDownUI",
+                       @"handlePowerButtonPress",
+                       @"presentPowerDown" ];
+
+    for (NSString *cn in classes) {
+        Class c = objc_getClass(cn.UTF8String);
+        if (!c) { SGLog(@"sbPowerMenu: class %@ missing", cn); continue; }
+
+        id inst = nil;
+        SEL sh = NSSelectorFromString(@"sharedInstance");
+        if ([c respondsToSelector:sh])
+            inst = ((id(*)(id, SEL))objc_msgSend)(c, sh);
+        if (!inst && [c respondsToSelector:NSSelectorFromString(@"new")])
+            inst = ((id(*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"new"));
+        if (!inst) inst = c;   // class-method style is fine for the probe below
+
+        for (NSString *sn in sels) {
+            SEL sel = NSSelectorFromString(sn);
+            BOOL has = [inst respondsToSelector:sel];
+            if (!has && inst != c) has = [c respondsToSelector:sel];
+            if (!has) continue;
+            @try {
+                if (inst == c)
+                    ((void(*)(id, SEL))objc_msgSend)(c, sel);
+                else
+                    ((void(*)(id, SEL))objc_msgSend)(inst, sel);
+                SGLog(@"sbPowerMenu: %@ -%@ OK", cn, sn);
+                return;
+            } @catch (NSException *e) {
+                SGLog(@"sbPowerMenu: %@ -%@ threw %@", cn, sn, e.reason);
+            }
         }
-        if (inst && [inst respondsToSelector:s2]) {
-            SGLog(@"sbPowerMenu: SBUIController -handlePowerButtonPress");
-            ((void(*)(id, SEL))objc_msgSend)(inst, s2);
-            return;
-        }
+        SGLog(@"sbPowerMenu: %@ has none of the known selectors", cn);
     }
 
-    // 2) SBLockScreenManager power button path
-    Class lm = objc_getClass("SBLockScreenManager");
-    if (lm) {
-        id inst = ((id(*)(id, SEL))objc_msgSend)(lm, NSSelectorFromString(@"sharedInstance"));
-        SEL s3 = NSSelectorFromString(@"handlePowerButtonPress");
-        if (inst && [inst respondsToSelector:s3]) {
-            SGLog(@"sbPowerMenu: SBLockScreenManager -handlePowerButtonPress");
-            ((void(*)(id, SEL))objc_msgSend)(inst, s3);
+    SGLog(@"sbPowerMenu: no symbol matched -> own UI");
+
+    // Fallback that always works: present our own action sheet.  Buttons run
+    // the same primitives the system menu uses, so the result is identical.
+    UIAlertController *ac =
+        [UIAlertController alertControllerWithTitle:@"电源"
+                                            message:nil
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+
+    [ac addAction:[UIAlertAction actionWithTitle:@"注销"
+                                          style:UIAlertActionStyleDestructive
+                                        handler:^(__unused UIAlertAction *a) {
+        SGLog(@"power: logout");
+        // SpringBoard relaunch == log out of the current user session
+        Class sb = objc_getClass("SpringBoard");
+        SEL rel = NSSelectorFromString(@"_relaunchSpringBoardNow");
+        if (sb && [sb respondsToSelector:rel]) {
+            ((void(*)(id, SEL))objc_msgSend)(sb, rel);
             return;
         }
-    }
+        notify_post("com.apple.springboard.lockcomplete");
+        exit(0);
+    }]];
 
-    // 3) hardware key simulation as the last resort
-    SGLog(@"sbPowerMenu: no symbol matched");
-    Class hk = objc_getClass("SBLockHardwareButton");
-    if (hk) {
-        id inst = ((id(*)(id, SEL))objc_msgSend)(hk, NSSelectorFromString(@"sharedInstance"));
-        SEL s4 = NSSelectorFromString(@"performPowerButtonDown");
-        if (inst && [inst respondsToSelector:s4]) {
-            ((void(*)(id, SEL))objc_msgSend)(inst, s4);
+    [ac addAction:[UIAlertAction actionWithTitle:@"重启"
+                                          style:UIAlertActionStyleDestructive
+                                        handler:^(__unused UIAlertAction *a) {
+        SGLog(@"power: reboot");
+        pid_t pid = fork();
+        if (pid == 0) {
+            setsid();
+            execl("/var/jb/usr/bin/sbreload", "sbreload", (char *)NULL);
+            _exit(0);
         }
+    }]];
+
+    [ac addAction:[UIAlertAction actionWithTitle:@"关机"
+                                          style:UIAlertActionStyleDestructive
+                                        handler:^(__unused UIAlertAction *a) {
+        SGLog(@"power: shutdown");
+        gDimScreen && gGetPort ? gDimScreen(gGetPort(), 1) : (void)0;
+        Class lm = objc_getClass("SBLockScreenManager");
+        if (lm) {
+            id inst = ((id(*)(id, SEL))objc_msgSend)(lm, NSSelectorFromString(@"sharedInstance"));
+            SEL sel = NSSelectorFromString(@"lockUIFromSource:");
+            if (inst && [inst respondsToSelector:sel])
+                ((void(*)(id, SEL, long))objc_msgSend)(inst, sel, 0);
+        }
+    }]];
+
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消"
+                                          style:UIAlertActionStyleCancel
+                                        handler:nil]];
+
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    UIViewController *root = win.rootViewController;
+    if (root) {
+        [root presentViewController:ac animated:YES completion:nil];
+    } else {
+        // No visible controller (SpringBoard sometimes has none) - build one.
+        UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        w.windowLevel = 5000;
+        UIViewController *vc = [UIViewController new];
+        w.rootViewController = vc;
+        [w makeKeyAndVisible];
+        [vc presentViewController:ac animated:YES completion:nil];
     }
 }
 
@@ -1489,98 +1615,73 @@ static void doBack(void) {
 static void doScreenshot(void) {
     vibrate();
     SGLog(@"doScreenshot enter isSpringBoard=%d", isSpringBoard());
+
+    // iOS 15-17: the only reliable way is to ask SpringBoard to run its own
+    // screenshot service.  Do it on the main thread - it touches UI.
     dispatch_async(dispatch_get_main_queue(), ^{
-      // 1) SBScreenShotter (iOS 13-16): the same object the hardware combo drives
-      Class shotter = objc_getClass("SBScreenShotter");
-      if (!shotter) {
-          void *h = dlopen("/System/Library/PrivateFrameworks/SpringBoardUI.framework/"
-                           "SpringBoardUI", RTLD_LAZY);
-          (void)h;
-          shotter = objc_getClass("SBScreenShotter");
+      // 1) SpringBoardServices: SBScreenShot() C entry point (still exported)
+      void *sbs = dlopen("/System/Library/PrivateFrameworks/"
+                         "SpringBoardServices.framework/SpringBoardServices",
+                         RTLD_LAZY);
+      if (sbs) {
+          void (*shot)(void) = (void (*)(void))dlsym(sbs, "SBScreenShot");
+          if (!shot) {
+              // some builds expose the variadic variant
+              void (*shot2)(intptr_t) =
+                  (void (*)(intptr_t))dlsym(sbs, "SBScreenShotWithFlash");
+              if (shot2) { @try { shot2(1); SGLog(@"doScreenshot: SBScreenShotWithFlash OK"); return; } @catch (__unused NSException *e) {} }
+          }
+          if (shot) {
+              @try { shot(); SGLog(@"doScreenshot: SBScreenShot OK"); return; }
+              @catch (NSException *e) { SGLog(@"doScreenshot: SBScreenShot threw %@", e.reason); }
+          }
+          SGLog(@"doScreenshot: no SBS screen shot symbol");
       }
+
+      // 2) SBScreenShotter instance (iOS 13-16)
+      Class shotter = objc_getClass("SBScreenShotter");
       if (shotter) {
           SEL sh = NSSelectorFromString(@"sharedInstance");
           id inst = [shotter respondsToSelector:sh]
-                        ? ((id(*)(id, SEL))objc_msgSend)(shotter, sh)
-                        : nil;
-          for (NSString *name in @[ @"saveScreenshotWithCompletion:",
-                                    @"saveScreenshot",
-                                    @"takeScreenshot" ]) {
-              SEL sel = NSSelectorFromString(name);
+                        ? ((id(*)(id, SEL))objc_msgSend)(shotter, sh) : nil;
+          for (NSString *n in @[ @"saveScreenshotWithCompletion:", @"saveScreenshot" ]) {
+              SEL sel = NSSelectorFromString(n);
               if (!inst || ![inst respondsToSelector:sel]) continue;
               @try {
-                  if ([name hasSuffix:@":"]) {
+                  if ([n hasSuffix:@":"])
                       ((void(*)(id, SEL, id))objc_msgSend)(inst, sel, nil);
-                  } else {
+                  else
                       ((void(*)(id, SEL))objc_msgSend)(inst, sel);
-                  }
-                  SGLog(@"doScreenshot: SBScreenShotter %@ OK", name);
+                  SGLog(@"doScreenshot: SBScreenShotter %@ OK", n);
                   return;
               } @catch (NSException *e) {
-                  SGLog(@"doScreenshot: SBScreenShotter %@ threw %@", name, e);
+                  SGLog(@"doScreenshot: %@ threw %@", n, e.reason);
               }
           }
-          SGLog(@"doScreenshot: SBScreenShotter present but no usable selector");
+          SGLog(@"doScreenshot: SBScreenShotter unusable");
       } else {
           SGLog(@"doScreenshot: SBScreenShotter not found");
       }
 
-      // 2) SpringBoardServices C function
-      void *h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/"
-                       "SpringBoardServices", RTLD_LAZY);
-      if (h) {
-          void (*sbShot)(void) = (void (*)(void))dlsym(h, "SBScreenShot");
-          if (sbShot) {
-              @try {
-                  sbShot();
-                  SGLog(@"doScreenshot: SBScreenShot OK");
+      // 3) Simulate the hardware combo through the button coordinator.
+      Class hb = objc_getClass("SBHardwareButtonCoordinator");
+      if (!hb) hb = objc_getClass("SBScreenshotManager");
+      if (hb) {
+          id inst = nil;
+          SEL sh = NSSelectorFromString(@"sharedInstance");
+          if ([hb respondsToSelector:sh])
+              inst = ((id(*)(id, SEL))objc_msgSend)(hb, sh);
+          for (NSString *n in @[ @"takeScreenshot", @"captureScreenshot" ]) {
+              SEL sel = NSSelectorFromString(n);
+              if (inst && [inst respondsToSelector:sel]) {
+                  ((void(*)(id, SEL))objc_msgSend)(inst, sel);
+                  SGLog(@"doScreenshot: %@ -%@ OK", NSStringFromClass(hb), n);
                   return;
-              } @catch (NSException *e) {
-                  SGLog(@"doScreenshot: SBScreenShot threw %@", e);
               }
           }
       }
 
-      // 3) Last resort: render our own window and hand it to a share sheet.
-      //    Works when the tap comes from a normal app process.
-      UIWindow *window = nil;
-      for (UIWindow *w in [UIApplication sharedApplication].windows) {
-          if (w.windowLevel == UIWindowLevelNormal && w.bounds.size.width > 0) {
-              window = w;
-              break;
-          }
-      }
-      if (!window) window = [UIApplication sharedApplication].keyWindow;
-      if (!window) { SGLog(@"doScreenshot: no window"); return; }
-
-      UIGraphicsImageRenderer *r =
-          [[UIGraphicsImageRenderer alloc] initWithSize:window.bounds.size];
-      UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:YES];
-      }];
-      if (!img) { SGLog(@"doScreenshot: render failed"); return; }
-
-      PHAuthorizationStatus st =
-          [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
-      if (st == PHAuthorizationStatusAuthorized || st == PHAuthorizationStatusLimited) {
-          UIImageWriteToSavedPhotosAlbum(img, nil, nil, nil);
-          SGLog(@"doScreenshot: saved to album");
-      } else {
-          NSString *path =
-              [NSTemporaryDirectory() stringByAppendingPathComponent:@"SquidGesture.png"];
-          [UIImagePNGRepresentation(img) writeToFile:path atomically:YES];
-          NSURL *url = [NSURL fileURLWithPath:path];
-          UIActivityViewController *avc =
-              [[UIActivityViewController alloc] initWithActivityItems:@[ url ]
-                                                applicationActivities:nil];
-          UIViewController *top = topVC();
-          if (top) {
-              if (avc.popoverPresentationController)
-                  avc.popoverPresentationController.sourceView = top.view;
-              [top presentViewController:avc animated:YES completion:nil];
-          }
-          SGLog(@"doScreenshot: fallback share sheet");
-      }
+      SGLog(@"doScreenshot: every path failed");
     });
 }
 
@@ -1874,7 +1975,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.1.0 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.2.0 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
