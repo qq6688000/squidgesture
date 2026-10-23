@@ -40,7 +40,7 @@ static BOOL gPanelVibrate = YES;
 static BOOL gPanelPrewarm = YES;        // preload panel apps while the panel is open
 static NSInteger gPanelPrewarmLimit = 4; // how many apps to prewarm per open
 static CGFloat gPanelBarTolerance = 28.0; // band height ABOVE the bar's top edge
-static CGFloat gPanelBarWidth     = 200.0; // zone width measured left from the right edge
+static CGFloat gPanelBarPad       = 34.0;  // finger slack around the bar's span
 static NSMutableArray<NSString *> *gPanelApps = nil;
 
 @class SGLauncherVC;
@@ -122,7 +122,7 @@ static void loadPrefs(void) {
 #undef LOAD
     if (p[@"PanelPrewarmLimit"]) gPanelPrewarmLimit = [p[@"PanelPrewarmLimit"] integerValue];
     if (p[@"PanelBarTolerance"]) gPanelBarTolerance = [p[@"PanelBarTolerance"] floatValue];
-    if (p[@"PanelBarWidth"]) gPanelBarWidth = [p[@"PanelBarWidth"] floatValue];
+    if (p[@"PanelBarPad"]) gPanelBarPad = [p[@"PanelBarPad"] floatValue];
 
     NSArray *list = p[@"PanelApps"];
     if (!list) list = @[ @"com.apple.MobileSMS", @"com.apple.mobilesafari",
@@ -1775,20 +1775,22 @@ static CGRect SGHomeBarRect(void) {
     // within PanelSwipeAboveBar points just above it) and in its right half,
     // running out to the screen edge. Nothing is measured from the screen edge,
     // so the zone lines up with the bar the user actually sees on any device.
-    CGFloat boxW      = MIN(MAX(gPanelBarWidth, 120.0), 280.0);
     CGFloat tolerance = MIN(MAX(gPanelBarTolerance, 0.0), 60.0);
+    CGFloat pad       = MIN(MAX(gPanelBarPad, 10.0), 80.0);
 
-    // Everything below is derived from the black bar's own rect - nothing is
-    // measured from the screen edge. The handsets put that bar ~134x5pt,
-    // centred, ~21pt above the bottom; using its real frame keeps the zone
-    // lined up with the pixels the user sees.
+    // The zone is the black bar's own rectangle, widened only by finger slack.
+    // Crucially its right edge is the BAR's right end - not the screen edge -
+    // so swiping up anywhere else on screen does not trigger anything.
     CGRect bar = SGHomeBarRect();
-    CGFloat zoneTop    = CGRectGetMinY(bar) - tolerance; // just above the bar
-    CGFloat zoneBottom = screen.height;                 // down past the bar
-    CGFloat zoneRight  = screen.width;                  // out to the right edge
-    // Must always include the bar's right end so a swipe starting on the bar
-    // itself registers, but never reach further left than PanelBarWidth.
-    CGFloat zoneLeft   = MIN(screen.width - boxW, CGRectGetMaxX(bar) - 20.0);
+    CGFloat barL = CGRectGetMinX(bar);
+    CGFloat barR = CGRectGetMaxX(bar);
+    CGFloat barT = CGRectGetMinY(bar);
+
+    // Right half of the bar (the user's "bottom-right of the black bar").
+    CGFloat zoneLeft   = MAX(barL, CGRectGetMidX(bar) - pad * 0.5);
+    CGFloat zoneRight  = barR + pad * 0.5;
+    CGFloat zoneTop    = barT - tolerance;
+    CGFloat zoneBottom = screen.height;
 
     BOOL inCorner = (sp.x >= zoneLeft) && (sp.x <= zoneRight) &&
                     (sp.y >= zoneTop)  && (sp.y <= zoneBottom);
@@ -1805,10 +1807,10 @@ static CGRect SGHomeBarRect(void) {
     }
 
     if (!objc_getAssociatedObject(g, &kPanelPanKey)) return YES;
-    SGLog(@"panelPan begin %.0f,%.0f%@ zone x[%.0f..%.0f] y[%.0f..%.0f] bar(y=%.0f h=%.0f) -> %d",
+    SGLog(@"panelPan begin %.0f,%.0f%@ zone x[%.0f..%.0f] y[%.0f..%.0f] bar(x[%.0f..%.0f] y=%.0f h=%.0f) -> %d",
           sp.x, sp.y, (pp && pp.hasStart) ? @"(touch-down)" : @"(current)",
           zoneLeft, zoneRight, zoneTop, zoneBottom,
-          CGRectGetMinY(bar), bar.size.height, inCorner);
+          barL, barR, CGRectGetMinY(bar), bar.size.height, inCorner);
     return inCorner;
 }
 
