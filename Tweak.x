@@ -39,6 +39,8 @@ static BOOL gPanelEnabled = YES;
 static BOOL gPanelVibrate = YES;
 static BOOL gPanelPrewarm = YES;        // preload panel apps while the panel is open
 static NSInteger gPanelPrewarmLimit = 4; // how many apps to prewarm per open
+static CGFloat gPanelSwipeHeight = 120.0; // trigger strip height from the bottom edge
+static CGFloat gPanelSwipeWidth  = 200.0; // trigger strip width from the right edge
 static NSMutableArray<NSString *> *gPanelApps = nil;
 
 @class SGLauncherVC;
@@ -92,6 +94,8 @@ static void loadPrefs(void) {
     LOAD("PanelPrewarm", gPanelPrewarm, boolValue);
 #undef LOAD
     if (p[@"PanelPrewarmLimit"]) gPanelPrewarmLimit = [p[@"PanelPrewarmLimit"] integerValue];
+    if (p[@"PanelSwipeHeight"]) gPanelSwipeHeight = [p[@"PanelSwipeHeight"] floatValue];
+    if (p[@"PanelSwipeWidth"]) gPanelSwipeWidth = [p[@"PanelSwipeWidth"] floatValue];
 
     NSArray *list = p[@"PanelApps"];
     if (!list) list = @[ @"com.apple.MobileSMS", @"com.apple.mobilesafari",
@@ -1621,23 +1625,27 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     UIWindow *win = v.window;
     CGPoint sp = (win ? [win convertPoint:p toWindow:nil] : p);
     CGSize screen = [UIScreen mainScreen].bounds.size;
-    CGFloat boxW = MAX(gCornerSize * 2.2, 185.0);
-    CGFloat boxH = MAX(gCornerSize * 3.4, 330.0);
+    // A shallow strip hugging the very bottom edge (the home indicator), NOT a
+    // tall quadrant. Measured from the bottom so it tracks the indicator on any
+    // device. Capped so a large CornerSize value can't balloon it again.
+    CGFloat boxW = MIN(MAX(gPanelSwipeWidth, 120.0), 280.0);
+    CGFloat boxH = MIN(MAX(gPanelSwipeHeight, 60.0), 160.0);
     BOOL inCorner = (sp.x > screen.width - boxW) && (sp.y > screen.height - boxH);
 
-    // The bottom-right corner belongs to the launcher panel. Without this the
+    // The bottom-right strip belongs to the launcher panel. Without this the
     // right-edge recognizer wins (the corner IS the right edge) and opens the
     // app switcher instead - exactly what the log showed.
     if (objc_getAssociatedObject(g, &kRightEdgeKey)) {
         if (inCorner && gPanelEnabled) {
-            SGLog(@"rightEdge vetoed in panel corner");
+            SGLog(@"rightEdge vetoed in panel strip");
             return NO;
         }
         return YES;
     }
 
     if (!objc_getAssociatedObject(g, &kPanelPanKey)) return YES;
-    SGLog(@"panelPan begin %.0f,%.0f box %.0fx%.0f -> %d", sp.x, sp.y, boxW, boxH, inCorner);
+    SGLog(@"panelPan begin %.0f,%.0f strip %.0fx%.0f (from bottom %.0f pt) -> %d",
+          sp.x, sp.y, boxW, boxH, gPanelSwipeHeight, inCorner);
     return inCorner;
 }
 
