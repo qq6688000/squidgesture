@@ -1524,6 +1524,26 @@ static void doScreenshot(void) {
 @end
 
 static char kAttachedKey;
+// A pan whose should-begin check runs after ~10pt of movement, so the location
+// at that moment is already above where the user actually put their finger.
+// On a tall box that never mattered; on a shallow bar-anchored band it pushes
+// the start point out of the zone. Remember the real starting point instead.
+@interface SGPanelPan : UIPanGestureRecognizer
+@property (nonatomic, assign) CGPoint startPoint;
+@property (nonatomic, assign) BOOL hasStart;
+@end
+
+@implementation SGPanelPan
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    UITouch *t = [touches anyObject];
+    if (t) {
+        self.startPoint = [t locationInView:self.view];
+        self.hasStart = YES;
+    }
+    [super touchesBegan:touches withEvent:event];
+}
+@end
+
 static char kPanelPanKey;
 static char kRightEdgeKey;
 static char kLinkedKey;
@@ -1599,8 +1619,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         [window addGestureRecognizer:g];
     }
     if (gPanelEnabled) {
-        UIPanGestureRecognizer *g =
-            [[UIPanGestureRecognizer alloc] initWithTarget:self
+        SGPanelPan *g = [[SGPanelPan alloc] initWithTarget:self
                                                     action:@selector(onPanelPan:)];
         g.minimumNumberOfTouches = 1;
         g.maximumNumberOfTouches = 1;
@@ -1634,7 +1653,9 @@ static BOOL SGIsGrabberClassName(NSString *n) {
 }
 
 static CGRect SGScanForGrabber(UIView *v, NSInteger depth) {
-    if (!v || v.hidden || v.alpha < 0.05 || depth > 14) return CGRectNull;
+    // NB: no hidden/alpha filtering. The home bar fades to near-zero alpha when
+    // idle, so skipping invisible views is what made detection fall back.
+    if (!v || depth > 16) return CGRectNull;
     if (SGIsGrabberClassName(NSStringFromClass([v class]))) {
         CGRect r = [v convertRect:v.bounds toView:nil];   // window coords
         CGSize ss = [UIScreen mainScreen].bounds.size;
@@ -1699,7 +1720,13 @@ static CGRect SGHomeBarRect(void) {
 
     // Screen-space corner box shared by the panel swipe and the right-edge
     // switcher, so the two can never fight over the same swipe.
+    //
+    // For the panel pan use the point where the finger FIRST touched down, not
+    // the current point: this callback fires after ~10pt of travel, and on a
+    // shallow band that is enough to leave the zone and kill a valid swipe.
     CGPoint p = [g locationInView:v];
+    SGPanelPan *pp = [g isKindOfClass:[SGPanelPan class]] ? (SGPanelPan *)g : nil;
+    if (pp && pp.hasStart) p = pp.startPoint;
     UIWindow *win = v.window;
     CGPoint sp = (win ? [win convertPoint:p toWindow:nil] : p);
     CGSize screen = [UIScreen mainScreen].bounds.size;
@@ -1737,8 +1764,9 @@ static CGRect SGHomeBarRect(void) {
     }
 
     if (!objc_getAssociatedObject(g, &kPanelPanKey)) return YES;
-    SGLog(@"panelPan begin %.0f,%.0f zone x[%.0f..%.0f] y[%.0f..%.0f] bar(y=%.0f h=%.0f) -> %d",
-          sp.x, sp.y, zoneLeft, zoneRight, zoneTop, zoneBottom,
+    SGLog(@"panelPan begin %.0f,%.0f%@ zone x[%.0f..%.0f] y[%.0f..%.0f] bar(y=%.0f h=%.0f) -> %d",
+          sp.x, sp.y, (pp && pp.hasStart) ? @"(touch-down)" : @"(current)",
+          zoneLeft, zoneRight, zoneTop, zoneBottom,
           CGRectGetMinY(bar), bar.size.height, inCorner);
     return inCorner;
 }
@@ -1748,6 +1776,16 @@ static CGRect SGHomeBarRect(void) {
 
     static BOOL fired = NO;
     UIGestureRecognizerState st = g.state;
+
+    // clear the remembered touch-down point once the gesture is over so a stale
+    // point can never be used to judge the next swipe
+    if ((st == UIGestureRecognizerStateEnded ||
+         st == UIGestureRecognizerStateCancelled ||
+         st == UIGestureRecognizerStateFailed) &&
+        [g isKindOfClass:[SGPanelPan class]]) {
+        ((SGPanelPan *)g).hasStart = NO;
+    }
+
     if (st == UIGestureRecognizerStateBegan) {
         fired = NO;
         return;
@@ -1869,25 +1907,55 @@ static void SGLatchHomeGesturePriority(void) {
         if (g) [ours addObject:g];
     if (!ours.count) return;
 
+    NSMutableArray *targets = [NSMutableArray array];
     for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        for (UIGestureRecognizer *g in w.gestureRecognizers) {
-            if (![g isKindOfClass:[UIScreenEdgePanGestureRecognizer class]]) continue;
-            UIScreenEdgePanGestureRecognizer *ep = (UIScreenEdgePanGestureRecognizer *)g;
-            if (!(ep.edges & UIRectEdgeBottom)) continue;
-            if (objc_getAssociatedObject(g, &kLinkedKey)) continue;
+        // recognizers can live on the window OR on its root view
+        for (UIGestureRecognizer *g in w.gestureRecognizers)
+            if (g) [targets addObject:g];
+        for (UIGestureRecognizer *g in w.rootViewController.view.gestureRecognizers)
+            if (g) [targets addObject:g];
+    }
 
-            BOOL ok = NO;
-            for (UIGestureRecognizer *o in ours) {
-                @try {
-                    [ep requireGestureRecognizerToFail:o];
-                    ok = YES;
-                } @catch (__unused NSException *e) {
-                }
+    for (UIGestureRecognizer *g in targets) {
+        NSString *cn = NSStringFromClass([g class]);
+
+        // SpringBoard's home swipe is SBHomeGesturePanGestureRecognizer (a plain
+        // pan subclass), NOT a UIScreenEdgePanGestureRecognizer - matching on
+        // the edge class alone silently missed it, which is why nothing was
+        // ever latched. Match the class family by name, and still accept a
+        // bottom-edge recognizer for other builds.
+        BOOL isHomeSwipe = [cn containsString:@"HomeGesture"] ||
+                           [cn containsString:@"Scrunch"] ||
+                           [cn containsString:@"SystemGesture"];
+        if (!isHomeSwipe && [g isKindOfClass:[UIScreenEdgePanGestureRecognizer class]]) {
+            UIScreenEdgePanGestureRecognizer *ep = (UIScreenEdgePanGestureRecognizer *)g;
+            isHomeSwipe = (ep.edges & UIRectEdgeBottom) != 0;
+        }
+        if (!isHomeSwipe) continue;
+        if ([g isKindOfClass:[SGPanelPan class]]) continue;
+        if (objc_getAssociatedObject(g, &kLinkedKey)) continue;
+
+        // requireGestureRecognizerToFail: needs both recognizers in the same
+        // view hierarchy, so prefer the pan that lives on this very view; fall
+        // back to the rest only if there is none.
+        NSMutableArray *ordered = [NSMutableArray array];
+        for (UIGestureRecognizer *o in ours)
+            if (o.view && g.view && o.view == g.view) [ordered addObject:o];
+        for (UIGestureRecognizer *o in ours)
+            if (![ordered containsObject:o]) [ordered addObject:o];
+
+        BOOL ok = NO;
+        for (UIGestureRecognizer *o in ordered) {
+            @try {
+                [g requireGestureRecognizerToFail:o];
+                ok = YES;
+                break;
+            } @catch (__unused NSException *e) {
             }
-            if (ok) {
-                objc_setAssociatedObject(g, &kLinkedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                SGLog(@"home gesture now waits for panel pan");
-            }
+        }
+        if (ok) {
+            objc_setAssociatedObject(g, &kLinkedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            SGLog(@"home gesture (%@) now waits for panel pan", cn);
         }
     }
 }
