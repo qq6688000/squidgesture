@@ -1627,6 +1627,8 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         if (!gPanelPans) gPanelPans = [NSHashTable weakObjectsHashTable];
         [gPanelPans addObject:g];
         [window addGestureRecognizer:g];
+        SGLog(@"panelEdge recognizer attached to %@ level=%.1f",
+              NSStringFromClass([window class]), (double)window.windowLevel);
     }
 }
 
