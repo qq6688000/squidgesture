@@ -29,6 +29,8 @@ static CGFloat gCornerSize = 80.0;
 static BOOL gLeftEdgeBack = YES;
 static BOOL gRightEdgeSwitcher = YES;
 static BOOL gCornerTapLock = YES;
+static BOOL gCornerTapPower = YES;      // 2.1.0: left top-bar double tap
+static BOOL gTwoFingerScreenshot = YES; // 2.1.0: two-finger swipe down
 static BOOL gCornerTapScreenshot = YES;
 static BOOL gThreeFingerHome = YES;
 static BOOL gThreeFingerSwitcher = YES;
@@ -84,6 +86,8 @@ static void loadPrefs(void) {
     LOAD("LeftEdgeBack", gLeftEdgeBack, boolValue);
     LOAD("RightEdgeSwitcher", gRightEdgeSwitcher, boolValue);
     LOAD("CornerTapLock", gCornerTapLock, boolValue);
+    LOAD("CornerTapPower", gCornerTapPower, boolValue);
+    LOAD("TwoFingerScreenshot", gTwoFingerScreenshot, boolValue);
     LOAD("CornerTapScreenshot", gCornerTapScreenshot, boolValue);
     LOAD("ThreeFingerHome", gThreeFingerHome, boolValue);
     LOAD("ThreeFingerSwitcher", gThreeFingerSwitcher, boolValue);
@@ -166,6 +170,8 @@ static void initSBS(void) {
 #define kNotifyLock     "com.minis.squidgesture.action.lock"
 #define kNotifySwitcher "com.minis.squidgesture.action.switcher"
 #define kNotifyPanel    "com.minis.squidgesture.action.panel"
+// 2.1.0: left-half top-bar double tap -> power menu
+#define kNotifyPower    "com.minis.squidgesture.action.power"
 // Fire this from a shell to open the panel without touching the screen:
 //   notify_post com.minis.squidgesture.test.panel
 #define kNotifyTest     "com.minis.squidgesture.test.panel"
@@ -1292,6 +1298,54 @@ static void sbLock(void) {
     }
 }
 
+// 2.1.0: power menu (log out / restart) for the left half of the status bar.
+// SpringBoard already owns this UI, so ask it to present it rather than
+// building our own - that keeps the icons, sliders and confirmations correct.
+static void sbPowerMenu(void) {
+    SGLog(@"sbPowerMenu");
+
+    // 1) SBUIController -presentPowerDownUI (iOS 12 and earlier, still present)
+    Class c = objc_getClass("SBUIController");
+    if (c) {
+        id inst = ((id(*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"sharedInstance"));
+        SEL s1 = NSSelectorFromString(@"presentPowerDownUI");
+        SEL s2 = NSSelectorFromString(@"handlePowerButtonPress");
+        if (inst && [inst respondsToSelector:s1]) {
+            SGLog(@"sbPowerMenu: SBUIController -presentPowerDownUI");
+            ((void(*)(id, SEL))objc_msgSend)(inst, s1);
+            return;
+        }
+        if (inst && [inst respondsToSelector:s2]) {
+            SGLog(@"sbPowerMenu: SBUIController -handlePowerButtonPress");
+            ((void(*)(id, SEL))objc_msgSend)(inst, s2);
+            return;
+        }
+    }
+
+    // 2) SBLockScreenManager power button path
+    Class lm = objc_getClass("SBLockScreenManager");
+    if (lm) {
+        id inst = ((id(*)(id, SEL))objc_msgSend)(lm, NSSelectorFromString(@"sharedInstance"));
+        SEL s3 = NSSelectorFromString(@"handlePowerButtonPress");
+        if (inst && [inst respondsToSelector:s3]) {
+            SGLog(@"sbPowerMenu: SBLockScreenManager -handlePowerButtonPress");
+            ((void(*)(id, SEL))objc_msgSend)(inst, s3);
+            return;
+        }
+    }
+
+    // 3) hardware key simulation as the last resort
+    SGLog(@"sbPowerMenu: no symbol matched");
+    Class hk = objc_getClass("SBLockHardwareButton");
+    if (hk) {
+        id inst = ((id(*)(id, SEL))objc_msgSend)(hk, NSSelectorFromString(@"sharedInstance"));
+        SEL s4 = NSSelectorFromString(@"performPowerButtonDown");
+        if (inst && [inst respondsToSelector:s4]) {
+            ((void(*)(id, SEL))objc_msgSend)(inst, s4);
+        }
+    }
+}
+
 static void sbSwitcher(void) {
     SGLog(@"sbSwitcher");
     Class c = objc_getClass("SBUIController");
@@ -1328,6 +1382,8 @@ static void actionNotifyCb(CFNotificationCenterRef c, void *o, CFStringRef n,
         } else if (CFStringCompare(n, CFSTR(kNotifyHome), 0) == kCFCompareEqualTo) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ sbHome(); });
+        } else if (CFStringCompare(n, CFSTR(kNotifyPower), 0) == kCFCompareEqualTo) {
+            vibrate(); sbPowerMenu();
         } else if (CFStringCompare(n, CFSTR(kNotifyHide), 0) == kCFCompareEqualTo) {
             SGLog(@"force hide received");
             SGLauncherHide();
@@ -1399,6 +1455,14 @@ static void doSwitcher(void) {
     vibrate();
     if (isSpringBoard()) { sbSwitcher(); return; }
     notify_post(kNotifySwitcher);
+}
+
+static void doPowerMenu(void) {
+    vibrate();
+    SGLog(@"doPowerMenu isSpringBoard=%d", isSpringBoard());
+    if (isSpringBoard()) { sbPowerMenu(); return; }
+    // Apps cannot present SpringBoard's power UI; bounce through SpringBoard.
+    notify_post(kNotifyPower);
 }
 
 static void doBack(void) {
@@ -1564,19 +1628,24 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     SGLog(@"attach to window %@ level=%.1f", NSStringFromClass([window class]),
           (double)window.windowLevel);
 
-    if (gLeftEdgeBack) {
-        UIScreenEdgePanGestureRecognizer *g =
-            [[UIScreenEdgePanGestureRecognizer alloc]
-                initWithTarget:self action:@selector(onLeftPan:)];
-        g.edges = UIRectEdgeLeft; g.delegate = self;
-        [window addGestureRecognizer:g];
-    }
+    // 2.1.0: left-edge back gesture removed at the user's request.
     if (gCornerTapLock || gCornerTapScreenshot) {
         UITapGestureRecognizer *g =
             [[UITapGestureRecognizer alloc] initWithTarget:self
                                                     action:@selector(onCornerTap:)];
         g.numberOfTapsRequired = 2; g.delegate = self;
         g.cancelsTouchesInView = NO;   // don't eat app taps
+        [window addGestureRecognizer:g];
+    }
+    if (gTwoFingerScreenshot) {
+        // 2.1.0: two-finger swipe DOWN takes a screenshot.
+        UISwipeGestureRecognizer *g =
+            [[UISwipeGestureRecognizer alloc] initWithTarget:self
+                                                      action:@selector(onTwoFingerDown:)];
+        g.direction = UISwipeGestureRecognizerDirectionDown;
+        g.numberOfTouchesRequired = 2;
+        g.cancelsTouchesInView = NO;
+        g.delegate = self;
         [window addGestureRecognizer:g];
     }
     if (gThreeFingerHome) {
@@ -1715,13 +1784,30 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     }
     CGRect screen = [UIScreen mainScreen].bounds;
 
-    BOOL topLeft  = (p.x < gCornerSize) && (p.y < gCornerSize);
-    BOOL topRight = (p.x > screen.size.width - gCornerSize) && (p.y < gCornerSize);
-    SGLog(@"cornerTap screen=%.0f,%.0f win=%.0f,%.0f L=%d R=%d",
-          p.x, p.y, inWindow.x, inWindow.y, topLeft, topRight);
+    // 2.1.0: two zones across the whole status bar, split at the middle.
+    //   right half of the top bar -> lock screen
+    //   left  half of the top bar -> power menu (log out / restart)
+    CGFloat barH = gCornerSize;
+    UIWindow *keyWin = g.view.window;
+    if (keyWin && keyWin.safeAreaInsets.top > 0)
+        barH = MAX(barH, keyWin.safeAreaInsets.top + 8.0);
+    if (barH < 44.0) barH = 44.0;
 
-    if (topLeft && gCornerTapLock) doLock();
-    else if (topRight && gCornerTapScreenshot) doScreenshot();
+    BOOL inTopBar = (p.y >= 0 && p.y <= barH);
+    BOOL leftHalf  = (p.x < screen.size.width / 2.0);
+    BOOL topLeft   = inTopBar && leftHalf;
+    BOOL topRight  = inTopBar && !leftHalf;
+    SGLog(@"topBarTap screen=%.0f,%.0f barH=%.0f L=%d R=%d",
+          p.x, p.y, barH, topLeft, topRight);
+
+    if (topRight && gCornerTapLock) doLock();
+    else if (topLeft && gCornerTapPower) doPowerMenu();
+}
+
+- (void)onTwoFingerDown:(UISwipeGestureRecognizer *)g {
+    if (!gEnabled || !gTwoFingerScreenshot) return;
+    SGLog(@"twoFingerDown -> screenshot");
+    doScreenshot();
 }
 
 - (void)onThreeFingerUp:(UISwipeGestureRecognizer *)g {
@@ -1788,7 +1874,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.0.0 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.1.0 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
@@ -1814,6 +1900,9 @@ static void attachAllWindows(void) {
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
             CFSTR(kNotifySwitcher), NULL, CFNotificationSuspensionBehaviorCoalesce);
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
+            CFSTR(kNotifyPower), NULL, CFNotificationSuspensionBehaviorCoalesce);
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
             CFSTR(kNotifyPanel), NULL, CFNotificationSuspensionBehaviorCoalesce);

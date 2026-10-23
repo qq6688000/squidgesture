@@ -66,10 +66,11 @@ fi
 
 killall -9 SpringBoard 2>/dev/null || true
 
-echo "SquidGesture 2.0.0 installed."
+echo "SquidGesture 2.1.0 installed."
 echo ""
 echo "  Swipe LEFT from the RIGHT screen edge -> app panel (+ to add apps)"
-echo "  Top-left 2x tap -> Lock    Top-right 2x tap -> Screenshot"
+echo "  Top bar 2x tap RIGHT -> Lock    Top bar 2x tap LEFT -> Power menu"
+echo "  2-finger swipe down -> Screenshot"
 echo "  3-finger up        -> Home        3-finger down    -> App switcher"
 echo ""
 echo "Manual panel test (no gesture needed):"
