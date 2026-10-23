@@ -1083,11 +1083,20 @@ static void SGLauncherShow(void) {
       gPanelWindow.frame = [UIScreen mainScreen].bounds;
       gPanelVC.view.frame = gPanelWindow.bounds;
 
-      // Just unhide. Do NOT call makeKeyWindow / makeKeyAndVisible here:
-      // stealing key status inside SpringBoard blocks the main thread.
       gPanelVC.view.userInteractionEnabled = YES;
       gPanelWindow.hidden = NO;
       gPanelWindow.alpha = 1.0;
+
+      // A window created inside SpringBoard is only composited after it has
+      // been made visible through the normal path at least once. 1.5.0 dropped
+      // this line and the panel stopped appearing; the freeze it was meant to
+      // avoid came from the synchronous app enumeration, which is now async.
+      // Guarded: a throw here must not take SpringBoard down.
+      @try {
+          [gPanelWindow makeKeyAndVisible];
+      } @catch (NSException *e) {
+          SGLog(@"makeKeyAndVisible threw: %@", e);
+      }
 
       [gPanelVC showPanel];
       SGLog(@"panel shown level=%.1f vcView=%@ hidden=%d",
@@ -1278,67 +1287,105 @@ static void doBack(void) {
     if (nav && nav.viewControllers.count > 1) [nav popViewControllerAnimated:YES];
 }
 
-// Crash-proof screenshot flash overlay
-static void showFlash(void) {
-    UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    w.windowLevel = UIWindowLevelAlert + 100;
-    w.backgroundColor = [UIColor whiteColor];
-    w.alpha = 1.0;
-    w.userInteractionEnabled = NO;
-    w.rootViewController = [[UIViewController alloc] init];
-    [w makeKeyAndVisible];
-    [UIView animateWithDuration:0.28 animations:^{
-        w.alpha = 0.0;
-    } completion:^(BOOL finished) {
-        w.hidden = YES;
-    }];
-}
-
+// Uses the system screenshot service. Rendering the window ourselves inside
+// SpringBoard only captures SpringBoard's own layers (never the frontmost app)
+// and SpringBoard has no permission to write into Photos - that is why the
+// top-right double tap appeared to do nothing.
 static void doScreenshot(void) {
     vibrate();
-    SGLog(@"doScreenshot: isSpringBoard=%d", isSpringBoard());
+    SGLog(@"doScreenshot enter isSpringBoard=%d", isSpringBoard());
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *window = nil;
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (w.windowLevel == UIWindowLevelNormal && w.bounds.size.width > 0) {
-                window = w; break;
-            }
-        }
-        if (!window) window = [UIApplication sharedApplication].keyWindow;
-        if (!window) { SGLog(@"doScreenshot: no window"); return; }
-        SGLog(@"doScreenshot: window=%@ size=%@", window, NSStringFromCGRect(window.bounds));
+      // 1) SBScreenShotter (iOS 13-16): the same object the hardware combo drives
+      Class shotter = objc_getClass("SBScreenShotter");
+      if (!shotter) {
+          void *h = dlopen("/System/Library/PrivateFrameworks/SpringBoardUI.framework/"
+                           "SpringBoardUI", RTLD_LAZY);
+          (void)h;
+          shotter = objc_getClass("SBScreenShotter");
+      }
+      if (shotter) {
+          SEL sh = NSSelectorFromString(@"sharedInstance");
+          id inst = [shotter respondsToSelector:sh]
+                        ? ((id(*)(id, SEL))objc_msgSend)(shotter, sh)
+                        : nil;
+          for (NSString *name in @[ @"saveScreenshotWithCompletion:",
+                                    @"saveScreenshot",
+                                    @"takeScreenshot" ]) {
+              SEL sel = NSSelectorFromString(name);
+              if (!inst || ![inst respondsToSelector:sel]) continue;
+              @try {
+                  if ([name hasSuffix:@":"]) {
+                      ((void(*)(id, SEL, id))objc_msgSend)(inst, sel, nil);
+                  } else {
+                      ((void(*)(id, SEL))objc_msgSend)(inst, sel);
+                  }
+                  SGLog(@"doScreenshot: SBScreenShotter %@ OK", name);
+                  return;
+              } @catch (NSException *e) {
+                  SGLog(@"doScreenshot: SBScreenShotter %@ threw %@", name, e);
+              }
+          }
+          SGLog(@"doScreenshot: SBScreenShotter present but no usable selector");
+      } else {
+          SGLog(@"doScreenshot: SBScreenShotter not found");
+      }
 
-        UIGraphicsImageRenderer *r =
-            [[UIGraphicsImageRenderer alloc] initWithSize:window.bounds.size];
-        UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-            [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:YES];
-        }];
-        if (!img) { SGLog(@"doScreenshot: render failed"); return; }
-        SGLog(@"doScreenshot: img=%@", NSStringFromCGSize(img.size));
-        showFlash();
+      // 2) SpringBoardServices C function
+      void *h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/"
+                       "SpringBoardServices", RTLD_LAZY);
+      if (h) {
+          void (*sbShot)(void) = (void (*)(void))dlsym(h, "SBScreenShot");
+          if (sbShot) {
+              @try {
+                  sbShot();
+                  SGLog(@"doScreenshot: SBScreenShot OK");
+                  return;
+              } @catch (NSException *e) {
+                  SGLog(@"doScreenshot: SBScreenShot threw %@", e);
+              }
+          }
+      }
 
-        PHAuthorizationStatus st =
-            [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
-        SGLog(@"doScreenshot: photoAuth=%ld", (long)st);
+      // 3) Last resort: render our own window and hand it to a share sheet.
+      //    Works when the tap comes from a normal app process.
+      UIWindow *window = nil;
+      for (UIWindow *w in [UIApplication sharedApplication].windows) {
+          if (w.windowLevel == UIWindowLevelNormal && w.bounds.size.width > 0) {
+              window = w;
+              break;
+          }
+      }
+      if (!window) window = [UIApplication sharedApplication].keyWindow;
+      if (!window) { SGLog(@"doScreenshot: no window"); return; }
 
-        if (st == PHAuthorizationStatusAuthorized || st == PHAuthorizationStatusLimited) {
-            UIImageWriteToSavedPhotosAlbum(img, nil, nil, nil);
-            SGLog(@"doScreenshot: saved to album");
-        } else {
-            NSString *path = [NSTemporaryDirectory()
-                stringByAppendingPathComponent:@"SquidGesture.png"];
-            BOOL ok = [UIImagePNGRepresentation(img) writeToFile:path atomically:YES];
-            SGLog(@"doScreenshot: wrote tmp=%d path=%@", ok, path);
-            NSURL *url = [NSURL fileURLWithPath:path];
-            UIActivityViewController *avc = [[UIActivityViewController alloc]
-                initWithActivityItems:@[url] applicationActivities:nil];
-            UIViewController *top = topVC();
-            if (top) {
-                if (avc.popoverPresentationController)
-                    avc.popoverPresentationController.sourceView = top.view;
-                [top presentViewController:avc animated:YES completion:nil];
-            }
-        }
+      UIGraphicsImageRenderer *r =
+          [[UIGraphicsImageRenderer alloc] initWithSize:window.bounds.size];
+      UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:YES];
+      }];
+      if (!img) { SGLog(@"doScreenshot: render failed"); return; }
+
+      PHAuthorizationStatus st =
+          [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
+      if (st == PHAuthorizationStatusAuthorized || st == PHAuthorizationStatusLimited) {
+          UIImageWriteToSavedPhotosAlbum(img, nil, nil, nil);
+          SGLog(@"doScreenshot: saved to album");
+      } else {
+          NSString *path =
+              [NSTemporaryDirectory() stringByAppendingPathComponent:@"SquidGesture.png"];
+          [UIImagePNGRepresentation(img) writeToFile:path atomically:YES];
+          NSURL *url = [NSURL fileURLWithPath:path];
+          UIActivityViewController *avc =
+              [[UIActivityViewController alloc] initWithActivityItems:@[ url ]
+                                                applicationActivities:nil];
+          UIViewController *top = topVC();
+          if (top) {
+              if (avc.popoverPresentationController)
+                  avc.popoverPresentationController.sourceView = top.view;
+              [top presentViewController:avc animated:YES completion:nil];
+          }
+          SGLog(@"doScreenshot: fallback share sheet");
+      }
     });
 }
 
@@ -1477,11 +1524,29 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 
 - (void)onCornerTap:(UITapGestureRecognizer *)g {
     if (!gEnabled) return;
-    CGPoint loc = [g locationInView:g.view];
-    CGRect b = g.view.bounds;
-    BOOL topLeft  = loc.x < gCornerSize && loc.y < gCornerSize;
-    BOOL topRight = loc.x > b.size.width - gCornerSize && loc.y < gCornerSize;
-    SGLog(@"cornerTap at %.0f,%.0f L=%d R=%d", loc.x, loc.y, topLeft, topRight);
+
+    // Gestures are attached to EVERY window, including small app-owned overlays
+    // (QQ and friends). Comparing window-local coordinates against the window's
+    // own bounds made a top-right tap inside a small window look like top-left,
+    // which is why the top-right double tap locked the screen instead of taking
+    // a screenshot. Always convert to SCREEN space first.
+    CGPoint inWindow = [g locationInView:g.view];
+    UIWindow *win = g.view.window;
+    CGPoint p = inWindow;
+    if (win) {
+        @try {
+            p = [win convertPoint:inWindow toWindow:nil];   // -> screen coords
+        } @catch (__unused NSException *e) {
+            p = inWindow;
+        }
+    }
+    CGRect screen = [UIScreen mainScreen].bounds;
+
+    BOOL topLeft  = (p.x < gCornerSize) && (p.y < gCornerSize);
+    BOOL topRight = (p.x > screen.size.width - gCornerSize) && (p.y < gCornerSize);
+    SGLog(@"cornerTap screen=%.0f,%.0f win=%.0f,%.0f L=%d R=%d",
+          p.x, p.y, inWindow.x, inWindow.y, topLeft, topRight);
+
     if (topLeft && gCornerTapLock) doLock();
     else if (topRight && gCornerTapScreenshot) doScreenshot();
 }

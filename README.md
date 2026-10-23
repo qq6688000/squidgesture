@@ -1,6 +1,6 @@
 # SquidGesture
 
-系统级手势插件（rootless / Dopamine 已验证）。v1.5.0 修复**右下角上划应用面板**。
+系统级手势插件（rootless / Dopamine 已验证）。v1.5.1 修复**右下角上划应用面板**。
 
 ## 手势列表
 
@@ -16,7 +16,7 @@
 
 所有手势触发时振动反馈。
 
-## 应用面板（v1.5.0 修复）
+## 应用面板（v1.5.1 修复）
 
 - 从**屏幕右下角**（默认 130×210pt 的角框内）向上滑动，弹出毛玻璃面板。
 - 面板是 4 列图标网格，底栏最后一个是 **＋**：
@@ -82,7 +82,7 @@ tail -50 /var/mobile/Library/Preferences/com.minis.squidgesture.log
 ## 安装
 
 ```bash
-dpkg -i com.minis.squidgesture_1.5.0_iphoneos-arm64.deb
+dpkg -i com.minis.squidgesture_1.5.1_iphoneos-arm64.deb
 # 或 sileo / zebra 直接装
 ```
 
