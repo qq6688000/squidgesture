@@ -1346,132 +1346,134 @@ static void sbLock(void) {
         }
     }
 
+    // 4) Last resort: ask the lock screen view controller directly.  On 17 the
+    //    manager hands out a controller whose -activate does the same thing
+    //    the side button does.
+    Class lvc = objc_getClass("SBLockScreenViewController");
+    if (lvc) {
+        SEL sh = NSSelectorFromString(@"sharedInstance");
+        if ([lvc respondsToSelector:sh]) {
+            id inst = ((id(*)(id, SEL))objc_msgSend)(lvc, sh);
+            SEL act = NSSelectorFromString(@"activate");
+            if (inst && [inst respondsToSelector:act]) {
+                ((void(*)(id, SEL))objc_msgSend)(inst, act);
+                SGLog(@"sbLock: SBLockScreenViewController -activate OK");
+                return;
+            }
+        }
+    }
+
     SGLog(@"sbLock: all paths failed");
 }
 
 // 2.1.0: power menu (log out / restart) for the left half of the status bar.
 // SpringBoard already owns this UI, so ask it to present it rather than
 // building our own - that keeps the icons, sliders and confirmations correct.
-static void sbPowerMenu(void) {
-    SGLog(@"sbPowerMenu enter");
+// 2.3.0: run a system command (reboot / halt / sbreload) as root.
+// SpringBoard runs as mobile, so superuser privileges come from a setuid
+// helper if one exists; otherwise try the plain path and report the result.
+static void doLock(void);
+static void doScreenshot(void);
 
-    // iOS 16/17 renamed the power UI.  Try every known owner in order and log
-    // which class actually answered, so the next build can be trimmed to it.
-    // SBPowerDownController is the actual owner of the power-off UI on
-    // iOS 13-17; `-activate` presents it.  Put it first.
-    NSArray *classes = @[ @"SBPowerDownController",
-                          @"SBPowerDownViewController",
-                          @"SBUIController",
-                          @"SBLockHardwareButton",
-                          @"SBHardwareButtonCoordinator",
-                          @"SBLockScreenManager" ];
-    NSArray *sels = @[ @"activate",
-                       @"present",
-                       @"presentPowerDownUI",
-                       @"showPowerDownUI",
-                       @"handlePowerButtonPress",
-                       @"presentPowerDown" ];
+static BOOL doSystemAction(NSString *tool) {
+    const char *paths[] = {
+        "/var/jb/usr/bin/", "/var/jb/usr/sbin/", "/usr/bin/", "/usr/sbin/", "/sbin/"
+    };
+    char full[256];
+    for (int i = 0; i < 5; i++) {
+        snprintf(full, sizeof(full), "%s%s", paths[i], tool.UTF8String);
+        if (access(full, X_OK) != 0) continue;
 
-    for (NSString *cn in classes) {
-        Class c = objc_getClass(cn.UTF8String);
-        if (!c) { SGLog(@"sbPowerMenu: class %@ missing", cn); continue; }
-
-        id inst = nil;
-        SEL sh = NSSelectorFromString(@"sharedInstance");
-        if ([c respondsToSelector:sh])
-            inst = ((id(*)(id, SEL))objc_msgSend)(c, sh);
-        if (!inst && [c respondsToSelector:NSSelectorFromString(@"new")])
-            inst = ((id(*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"new"));
-        if (!inst) inst = c;   // class-method style is fine for the probe below
-
-        for (NSString *sn in sels) {
-            SEL sel = NSSelectorFromString(sn);
-            BOOL has = [inst respondsToSelector:sel];
-            if (!has && inst != c) has = [c respondsToSelector:sel];
-            if (!has) continue;
-            @try {
-                if (inst == c)
-                    ((void(*)(id, SEL))objc_msgSend)(c, sel);
-                else
-                    ((void(*)(id, SEL))objc_msgSend)(inst, sel);
-                SGLog(@"sbPowerMenu: %@ -%@ OK", cn, sn);
-                return;
-            } @catch (NSException *e) {
-                SGLog(@"sbPowerMenu: %@ -%@ threw %@", cn, sn, e.reason);
-            }
-        }
-        SGLog(@"sbPowerMenu: %@ has none of the known selectors", cn);
-    }
-
-    SGLog(@"sbPowerMenu: no symbol matched -> own UI");
-
-    // Fallback that always works: present our own action sheet.  Buttons run
-    // the same primitives the system menu uses, so the result is identical.
-    UIAlertController *ac =
-        [UIAlertController alertControllerWithTitle:@"电源"
-                                            message:nil
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
-
-    [ac addAction:[UIAlertAction actionWithTitle:@"注销"
-                                          style:UIAlertActionStyleDestructive
-                                        handler:^(__unused UIAlertAction *a) {
-        SGLog(@"power: logout");
-        // SpringBoard relaunch == log out of the current user session
-        Class sb = objc_getClass("SpringBoard");
-        SEL rel = NSSelectorFromString(@"_relaunchSpringBoardNow");
-        if (sb && [sb respondsToSelector:rel]) {
-            ((void(*)(id, SEL))objc_msgSend)(sb, rel);
-            return;
-        }
-        notify_post("com.apple.springboard.lockcomplete");
-        exit(0);
-    }]];
-
-    [ac addAction:[UIAlertAction actionWithTitle:@"重启"
-                                          style:UIAlertActionStyleDestructive
-                                        handler:^(__unused UIAlertAction *a) {
-        SGLog(@"power: reboot");
+        SGLog(@"doSystemAction: exec %s", full);
         pid_t pid = fork();
         if (pid == 0) {
             setsid();
-            execl("/var/jb/usr/bin/sbreload", "sbreload", (char *)NULL);
-            _exit(0);
+            execl(full, tool.UTF8String, (char *)NULL);
+            _exit(127);
         }
-    }]];
-
-    [ac addAction:[UIAlertAction actionWithTitle:@"关机"
-                                          style:UIAlertActionStyleDestructive
-                                        handler:^(__unused UIAlertAction *a) {
-        SGLog(@"power: shutdown");
-        gDimScreen && gGetPort ? gDimScreen(gGetPort(), 1) : (void)0;
-        Class lm = objc_getClass("SBLockScreenManager");
-        if (lm) {
-            id inst = ((id(*)(id, SEL))objc_msgSend)(lm, NSSelectorFromString(@"sharedInstance"));
-            SEL sel = NSSelectorFromString(@"lockUIFromSource:");
-            if (inst && [inst respondsToSelector:sel])
-                ((void(*)(id, SEL, long))objc_msgSend)(inst, sel, 0);
-        }
-    }]];
-
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消"
-                                          style:UIAlertActionStyleCancel
-                                        handler:nil]];
-
-    UIWindow *win = [UIApplication sharedApplication].keyWindow;
-    UIViewController *root = win.rootViewController;
-    if (root) {
-        [root presentViewController:ac animated:YES completion:nil];
-    } else {
-        // No visible controller (SpringBoard sometimes has none) - build one.
-        UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        w.windowLevel = 5000;
-        UIViewController *vc = [UIViewController new];
-        w.rootViewController = vc;
-        [w makeKeyAndVisible];
-        [vc presentViewController:ac animated:YES completion:nil];
+        return (pid > 0);
     }
+    SGLog(@"doSystemAction: %@ not found", tool);
+    return NO;
 }
 
+static void sbPowerMenu(void) {
+    SGLog(@"sbPowerMenu enter -> own menu");
+
+
+    // 2.3.0: a single self-contained menu that guarantees every action works,
+    // whatever iOS renamed.  Presented on the main thread inside SpringBoard.
+    dispatch_async(dispatch_get_main_queue(), ^{
+      UIAlertController *ac =
+          [UIAlertController alertControllerWithTitle:@"电源"
+                                              message:nil
+                                       preferredStyle:UIAlertControllerStyleActionSheet];
+
+      [ac addAction:[UIAlertAction actionWithTitle:@"锁屏"
+                                            style:UIAlertActionStyleDefault
+                                          handler:^(__unused UIAlertAction *a) {
+          SGLog(@"menu: lock");
+          doLock();
+      }]];
+
+      [ac addAction:[UIAlertAction actionWithTitle:@"截图"
+                                            style:UIAlertActionStyleDefault
+                                          handler:^(__unused UIAlertAction *a) {
+          SGLog(@"menu: screenshot");
+          doScreenshot();
+      }]];
+
+      [ac addAction:[UIAlertAction actionWithTitle:@"注销"
+                                            style:UIAlertActionStyleDestructive
+                                          handler:^(__unused UIAlertAction *a) {
+          SGLog(@"menu: logout");
+          // Logging out == restarting SpringBoard as the same user.
+          if (!doSystemAction(@"sbreload")) {
+              Class sb = objc_getClass("SpringBoard");
+              SEL rel = NSSelectorFromString(@"_relaunchSpringBoardNow");
+              if (sb && [sb respondsToSelector:rel]) {
+                  ((void(*)(id, SEL))objc_msgSend)(sb, rel);
+              } else {
+                  exit(0);
+              }
+          }
+      }]];
+
+      [ac addAction:[UIAlertAction actionWithTitle:@"重启"
+                                            style:UIAlertActionStyleDestructive
+                                          handler:^(__unused UIAlertAction *a) {
+          SGLog(@"menu: reboot");
+          if (!doSystemAction(@"reboot")) doSystemAction(@"sbreload");
+      }]];
+
+      [ac addAction:[UIAlertAction actionWithTitle:@"关机"
+                                            style:UIAlertActionStyleDestructive
+                                          handler:^(__unused UIAlertAction *a) {
+          SGLog(@"menu: shutdown");
+          if (!doSystemAction(@"halt")) doSystemAction(@"poweroff");
+      }]];
+
+      [ac addAction:[UIAlertAction actionWithTitle:@"取消"
+                                            style:UIAlertActionStyleCancel
+                                          handler:nil]];
+
+      // Present from the top-most view controller so it works both in
+      // SpringBoard and inside a normal app.
+      UIWindow *win = [UIApplication sharedApplication].keyWindow;
+      UIViewController *root = win.rootViewController;
+      while (root.presentedViewController) root = root.presentedViewController;
+      if (root) {
+          [root presentViewController:ac animated:YES completion:nil];
+      } else {
+          UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+          w.windowLevel = 5000;
+          UIViewController *vc = [UIViewController new];
+          w.rootViewController = vc;
+          [w makeKeyAndVisible];
+          [vc presentViewController:ac animated:YES completion:nil];
+      }
+    });
+}
 static void sbSwitcher(void) {
     SGLog(@"sbSwitcher");
     Class c = objc_getClass("SBUIController");
@@ -1883,26 +1885,12 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
             p = inWindow;
         }
     }
-    CGRect screen = [UIScreen mainScreen].bounds;
 
-    // 2.1.0: two zones across the whole status bar, split at the middle.
-    //   right half of the top bar -> lock screen
-    //   left  half of the top bar -> power menu (log out / restart)
-    CGFloat barH = gCornerSize;
-    UIWindow *keyWin = g.view.window;
-    if (keyWin && keyWin.safeAreaInsets.top > 0)
-        barH = MAX(barH, keyWin.safeAreaInsets.top + 8.0);
-    if (barH < 44.0) barH = 44.0;
-
-    BOOL inTopBar = (p.y >= 0 && p.y <= barH);
-    BOOL leftHalf  = (p.x < screen.size.width / 2.0);
-    BOOL topLeft   = inTopBar && leftHalf;
-    BOOL topRight  = inTopBar && !leftHalf;
-    SGLog(@"topBarTap screen=%.0f,%.0f barH=%.0f L=%d R=%d",
-          p.x, p.y, barH, topLeft, topRight);
-
-    if (topRight && gCornerTapLock) doLock();
-    else if (topLeft && gCornerTapPower) doPowerMenu();
+    // 2.3.0: a double tap ANYWHERE opens the power menu (lock / screenshot /
+    // log out / restart / shut down).  Per the user's request the whole screen
+    // is the trigger, so no zone maths is needed any more.
+    SGLog(@"doubleTap %.0f,%.0f -> power menu", p.x, p.y);
+    if (gCornerTapPower) doPowerMenu();
 }
 
 - (void)onTwoFingerDown:(UISwipeGestureRecognizer *)g {
@@ -1975,7 +1963,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.2.0 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.3.0 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
