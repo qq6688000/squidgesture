@@ -25,12 +25,12 @@
 static BOOL gEnabled = YES;
 static CGFloat gCornerSize = 80.0;
 
-static BOOL gLeftEdgeBack = YES;
-static BOOL gRightEdgeSwitcher = YES;
+static BOOL gLeftEdgeBack = NO;
+static BOOL gRightEdgeSwitcher = NO;
 static BOOL gCornerTapLock = YES;
 static BOOL gCornerTapScreenshot = YES;
-static BOOL gThreeFingerHome = YES;
-static BOOL gThreeFingerSwitcher = YES;
+static BOOL gThreeFingerHome = NO;
+static BOOL gThreeFingerSwitcher = NO;
 static BOOL gVibrationFeedback = YES;
 static BOOL gDebugLog = YES;   // v1.4.0: on by default for diagnosis
 
@@ -201,11 +201,13 @@ static void initSBS(void) {
 #define kNotifyHide     "com.minis.squidgesture.test.hide"
 
 static void vibrate(void) {
-    if (gVibrationFeedback) AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
+    // v1.6.4: all haptic feedback disabled at the user's request.
+    (void)0;
 }
 
 static void SGPanelVibrate(void) {
-    if (gPanelVibrate) AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
+    // v1.6.4: all haptic feedback disabled at the user's request.
+    (void)0;
 }
 
 #pragma mark - Launcher panel : app catalog
@@ -1606,21 +1608,8 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     SGLog(@"attach to window %@ level=%.1f", NSStringFromClass([window class]),
           (double)window.windowLevel);
 
-    if (gLeftEdgeBack) {
-        UIScreenEdgePanGestureRecognizer *g =
-            [[UIScreenEdgePanGestureRecognizer alloc]
-                initWithTarget:self action:@selector(onLeftPan:)];
-        g.edges = UIRectEdgeLeft; g.delegate = self;
-        [window addGestureRecognizer:g];
-    }
-    if (gRightEdgeSwitcher) {
-        UIScreenEdgePanGestureRecognizer *g =
-            [[UIScreenEdgePanGestureRecognizer alloc]
-                initWithTarget:self action:@selector(onRightPan:)];
-        g.edges = UIRectEdgeRight; g.delegate = self;
-        objc_setAssociatedObject(g, &kRightEdgeKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [window addGestureRecognizer:g];
-    }
+    // v1.6.4: left-edge back gesture removed at the user's request.
+    // v1.6.4: right-edge switcher gesture removed at the user's request.
     if (gCornerTapLock || gCornerTapScreenshot) {
         UITapGestureRecognizer *g =
             [[UITapGestureRecognizer alloc] initWithTarget:self
@@ -2034,6 +2023,12 @@ static void attachAllWindows(void) {
 }
 
 %ctor {
+    // v1.6.4: the filter is Mode = Any so the panel works inside every app.
+    // Daemons and other non-UI processes must be left completely alone.
+    if (!NSClassFromString(@"UIApplication") ||
+        !NSClassFromString(@"UIWindow")) {
+        return;
+    }
     loadPrefs();
     initSBS();
 
