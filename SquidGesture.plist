@@ -1,5 +1,9 @@
 {
     Filter = {
-        Bundles = ( "com.apple.UIKit", "com.apple.springboard" );
+        Bundles = (
+            "com.apple.UIKit",
+            "com.apple.springboard",
+            "com.tencent.mqq"
+        );
     };
 }

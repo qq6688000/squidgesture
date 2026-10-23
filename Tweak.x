@@ -58,6 +58,8 @@ static NSString *const kPrefsFile =
 static NSString *const kLogFile =
     @"/var/mobile/Library/Preferences/com.minis.squidgesture.log";
 
+static BOOL isSpringBoard(void);
+
 static void SGLog(NSString *fmt, ...) {
     if (!gDebugLog) return;
     va_list ap; va_start(ap, fmt);
@@ -70,9 +72,34 @@ static void SGLog(NSString *fmt, ...) {
         [fh seekToEndOfFile];
         [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
         [fh closeFile];
-    } else {
-        [line writeToFile:kLogFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        return;
     }
+    // A sandboxed app cannot write /var/mobile/Library/Preferences; fall back to
+    // its own container so in-app diagnostics still land somewhere readable.
+    static NSString *fallbackPath = nil;
+    static BOOL fallbackTried = NO;
+    if (!fallbackTried) {
+        fallbackTried = YES;
+        if (!isSpringBoard()) {
+            NSString *dir = NSSearchPathForDirectoriesInDomains(
+                NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
+            if (dir) fallbackPath = [dir stringByAppendingPathComponent:
+                                     @"com.minis.squidgesture.log"];
+        }
+    }
+    if (fallbackPath) {
+        NSFileHandle *fh2 = [NSFileHandle fileHandleForWritingAtPath:fallbackPath];
+        if (fh2) {
+            [fh2 seekToEndOfFile];
+            [fh2 writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh2 closeFile];
+        } else {
+            [line writeToFile:fallbackPath atomically:YES
+                     encoding:NSUTF8StringEncoding error:nil];
+        }
+        return;
+    }
+    [line writeToFile:kLogFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
 static void loadPrefs(void) {
@@ -1698,19 +1725,33 @@ static CGRect SGHomeBarRect(void) {
         }
     }
 
-    // Fallback: the bar lives inside the bottom safe-area band.
+    // Fallback: the bar lives inside the bottom safe-area band. In a normal app
+    // the bar itself belongs to SpringBoard, so the scan above finds nothing -
+    // but the app window still reports the correct bottom inset, which is
+    // exactly the band the bar sits in.
     UIWindow *key = [UIApplication sharedApplication].keyWindow;
-    CGFloat inset = key ? key.safeAreaInsets.bottom : 34.0;
+    if (!key) key = [UIApplication sharedApplication].windows.firstObject;
+    CGFloat inset = key ? key.safeAreaInsets.bottom : 0;
     if (inset <= 0) inset = 34.0;
+
+    // Use the window's height, not the screen's: they match in full-screen apps
+    // but the window is what our gesture coordinates are converted against.
     CGSize ss = [UIScreen mainScreen].bounds.size;
+    CGFloat screenH = ss.height;
+    CGFloat screenW = ss.width;
+    if (key && key.bounds.size.height > 0) {
+        screenH = key.bounds.size.height;
+        screenW = key.bounds.size.width;
+    }
     CGFloat barH = 5.0;
-    CGFloat barW = MIN(ss.width * 0.36, 154.0);
-    cached = CGRectMake((ss.width - barW) / 2.0,
-                        ss.height - inset + (inset - barH) / 2.0,
+    CGFloat barW = MIN(screenW * 0.36, 154.0);
+    cached = CGRectMake((screenW - barW) / 2.0,
+                        screenH - inset + (inset - barH) / 2.0,
                         barW, barH);
     cachedValid = YES; cachedScreen = nowScreen;
-    SGLog(@"homeBar fallback (safeArea %.0f) -> %.0f,%.0f %.0fx%.0f",
-          inset, cached.origin.x, cached.origin.y, cached.size.width, cached.size.height);
+    SGLog(@"homeBar fallback (safeArea %.0f, window %.0fx%.0f) -> %.0f,%.0f %.0fx%.0f",
+          inset, screenW, screenH,
+          cached.origin.x, cached.origin.y, cached.size.width, cached.size.height);
     return cached;
 }
 
