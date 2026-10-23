@@ -746,11 +746,24 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     }
     SGCatalogItem *it = tile.item;
     SGPanelVibrate();
+    NSString *bid = it.bundleID;
     [self hidePanel];
-    if (it.bundleID.length) {
-        NSString *bid = it.bundleID;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ SGLaunchApp(bid); });
+    // Give SpringBoard a couple of runloop turns after the window is hidden and
+    // key status is restored - activating an app mid-transition is what made
+    // the screen hang for 3-5 seconds.
+    if (bid.length) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+                         NSTimeInterval t0 = [NSDate timeIntervalSinceReferenceDate];
+                         BOOL ok = NO;
+                         @try {
+                             ok = SGLaunchApp(bid);
+                         } @catch (NSException *e) {
+                             SGLog(@"launch %@ threw %@", bid, e);
+                         }
+                         SGLog(@"launch %@ done ok=%d in %.0f ms", bid, ok,
+                               ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0);
+                       });
     }
 }
 
@@ -1092,10 +1105,25 @@ static void SGLauncherShow(void) {
       // this line and the panel stopped appearing; the freeze it was meant to
       // avoid came from the synchronous app enumeration, which is now async.
       // Guarded: a throw here must not take SpringBoard down.
+      // Remember who owned the keyboard, so we can hand key status straight back.
+      if (!gPanelPrevKey) {
+          for (UIWindow *w in [UIApplication sharedApplication].windows) {
+              if (w.isKeyWindow && w != gPanelWindow) { gPanelPrevKey = w; break; }
+          }
+      }
       @try {
           [gPanelWindow makeKeyAndVisible];
       } @catch (NSException *e) {
           SGLog(@"makeKeyAndVisible threw: %@", e);
+      }
+      // Hand key status back immediately. The call above is only needed so the
+      // window gets composited; leaving our level-5000 window as the key window
+      // makes SpringBoard stall for seconds when the next app is activated.
+      if (gPanelPrevKey) {
+          @try {
+              [gPanelPrevKey makeKeyWindow];
+          } @catch (__unused NSException *e) {
+          }
       }
 
       [gPanelVC showPanel];
@@ -1107,6 +1135,28 @@ static void SGLauncherShow(void) {
 
 static void SGLauncherHideNow(void) {
     if (!gPanelWindow) return;
+
+    // Release key status BEFORE hiding, otherwise SpringBoard is left with no
+    // key window and the next app activation blocks for several seconds.
+    UIWindow *back = gPanelPrevKey;
+    gPanelPrevKey = nil;
+    if (back && back != gPanelWindow && !back.hidden) {
+        @try {
+            [back makeKeyWindow];
+        } @catch (__unused NSException *e) {
+        }
+    } else if (gPanelWindow.isKeyWindow) {
+        // fall back to any other visible window
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w == gPanelWindow || w.hidden || w.windowLevel >= 4000) continue;
+            @try {
+                [w makeKeyWindow];
+            } @catch (__unused NSException *e) {
+            }
+            break;
+        }
+    }
+
     gPanelWindow.hidden = YES;
     gPanelWindow.alpha = 1.0;
     gPanelVC.view.alpha = 1.0;

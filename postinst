@@ -52,7 +52,7 @@ fi
 
 killall -9 SpringBoard 2>/dev/null || true
 
-echo "SquidGesture 1.5.2 installed."
+echo "SquidGesture 1.5.3 installed."
 echo ""
 echo "  Swipe up from the BOTTOM-RIGHT corner -> app panel (+ to add apps)"
 echo "  Left edge swipe    -> Back        Right edge swipe -> App switcher"
