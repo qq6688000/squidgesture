@@ -37,8 +37,6 @@ if [ ! -f "$PREFS" ]; then
     <key>PanelVibrate</key><true/>
     <key>PanelPrewarm</key><true/>
     <key>PanelPrewarmLimit</key><integer>4</integer>
-    <key>PanelBarTolerance</key><real>40</real>
-    <key>PanelBarPad</key><real>34</real>
     <key>PanelApps</key>
     <array>
         <string>com.apple.MobileSMS</string>

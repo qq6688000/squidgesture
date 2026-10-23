@@ -39,8 +39,6 @@ static BOOL gPanelEnabled = YES;
 static BOOL gPanelVibrate = YES;
 static BOOL gPanelPrewarm = YES;        // preload panel apps while the panel is open
 static NSInteger gPanelPrewarmLimit = 4; // how many apps to prewarm per open
-static CGFloat gPanelBarTolerance = 40.0; // band height ABOVE the bar's top edge
-static CGFloat gPanelBarPad       = 34.0;  // finger slack around the bar's span
 static NSMutableArray<NSString *> *gPanelApps = nil;
 
 @class SGLauncherVC;
@@ -49,7 +47,6 @@ static SGLauncherVC *gPanelVC;
 static __weak UIWindow *gPanelPrevKey;
 static void SGLauncherShow(void);
 static void SGLauncherHide(void);
-static void SGLatchHomeGesturePriority(void);
 
 static __weak UIWindowScene *gCachedScene = nil;
 
@@ -121,8 +118,6 @@ static void loadPrefs(void) {
     LOAD("PanelPrewarm", gPanelPrewarm, boolValue);
 #undef LOAD
     if (p[@"PanelPrewarmLimit"]) gPanelPrewarmLimit = [p[@"PanelPrewarmLimit"] integerValue];
-    if (p[@"PanelBarTolerance"]) gPanelBarTolerance = [p[@"PanelBarTolerance"] floatValue];
-    if (p[@"PanelBarPad"]) gPanelBarPad = [p[@"PanelBarPad"] floatValue];
 
     NSArray *list = p[@"PanelApps"];
     if (!list) list = @[ @"com.apple.MobileSMS", @"com.apple.mobilesafari",
@@ -1227,8 +1222,7 @@ static void SGLauncherShow(void) {
 
       [gPanelVC showPanel];
 
-      SGLatchHomeGesturePriority();
-
+  
       // Prewarm shortly after the sheet finishes animating so it stays smooth.
       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                      dispatch_get_main_queue(), ^{ SGPrewarmPanelApps(); });
@@ -1574,8 +1568,6 @@ static char kAttachedKey;
 @end
 
 static char kPanelPanKey;
-static char kRightEdgeKey;
-static char kLinkedKey;
 static NSHashTable *gPanelPans = nil;   // weak refs to every panel pan we install
 
 @implementation SGHandler
@@ -1654,175 +1646,34 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     }
 }
 
-#pragma mark - Home indicator (the black bar) as the anchor
-
-// The trigger area must be anchored to the black home bar itself, not measured
-// up from the screen edge: the bar's height and inset vary per device, so a
-// screen-relative number never lines up with what the user actually sees.
-//
-// We look for SpringBoard's own affordance view (SBHomeGrabberView /
-// _UIHomeAffordance* / SBHomeIndicatorView) and use its real frame. If nothing
-// is found (view not loaded yet, renamed class) we fall back to the bottom
-// safe-area inset, which is exactly the bar's reserved band.
-
-static BOOL SGIsGrabberClassName(NSString *n) {
-    if (!n.length) return NO;
-    return [n containsString:@"HomeGrabber"] ||
-           [n containsString:@"HomeAffordance"] ||
-           [n containsString:@"HomeIndicator"];
-}
-
-static CGRect SGScanForGrabber(UIView *v, NSInteger depth) {
-    // NB: no hidden/alpha filtering. The home bar fades to near-zero alpha when
-    // idle, so skipping invisible views is what made detection fall back.
-    if (!v || depth > 16) return CGRectNull;
-    if (SGIsGrabberClassName(NSStringFromClass([v class]))) {
-        CGRect r = [v convertRect:v.bounds toView:nil];   // window coords
-        CGSize ss = [UIScreen mainScreen].bounds.size;
-        // Sanity: the real home bar is a short pill sitting in the bottom
-        // sliver of the screen. Anything else that happens to match the class
-        // name (there can be several grabbers) is rejected.
-        BOOL shapeOK = (r.size.width >= 60 && r.size.width <= ss.width * 0.9 &&
-                        r.size.height >= 1 && r.size.height <= 30);
-        BOOL placeOK = (r.origin.y >= ss.height * 0.85);
-        BOOL centred = (fabs((r.origin.x + r.size.width * 0.5) - ss.width * 0.5)
-                        <= ss.width * 0.12);
-        if (shapeOK && placeOK && centred) return r;
-    }
-    for (UIView *sub in v.subviews) {
-        CGRect r = SGScanForGrabber(sub, depth + 1);
-        if (!CGRectIsNull(r)) return r;
-    }
-    return CGRectNull;
-}
-
-// Returns the black bar's rect in screen coordinates.
-static CGRect SGHomeBarRect(void) {
-    static CGRect cached = {0};
-    static BOOL cachedValid = NO;
-    static CGSize cachedScreen = {0, 0};
-
-    CGSize nowScreen = [UIScreen mainScreen].bounds.size;
-    if (cachedValid && CGSizeEqualToSize(nowScreen, cachedScreen)) return cached;
-    cachedValid = NO;
-
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        CGRect r = SGScanForGrabber(w, 0);
-        if (!CGRectIsNull(r)) {
-            r.origin.x += w.frame.origin.x;
-            r.origin.y += w.frame.origin.y;
-            if (r.size.width >= 60) {
-                // The real home bar is centred. A view that matches the class
-                // name but sits off-centre is a different grabber (or lives in
-                // an offset window) - using it would slide the zone sideways.
-                CGSize scr = [UIScreen mainScreen].bounds.size;
-                CGFloat mid = r.origin.x + r.size.width * 0.5;
-                if (fabs(mid - scr.width * 0.5) > scr.width * 0.12) {
-                    SGLog(@"homeBar rejected off-centre %.0f,%.0f %.0fx%.0f",
-                          r.origin.x, r.origin.y, r.size.width, r.size.height);
-                    continue;
-                }
-                cached = r; cachedValid = YES; cachedScreen = nowScreen;
-                SGLog(@"homeBar detected %.0f,%.0f %.0fx%.0f",
-                      r.origin.x, r.origin.y, r.size.width, r.size.height);
-                return cached;
-            }
-        }
-    }
-
-    // Fallback: the bar lives inside the bottom safe-area band. In a normal app
-    // the bar itself belongs to SpringBoard, so the scan above finds nothing -
-    // but the app window still reports the correct bottom inset, which is
-    // exactly the band the bar sits in.
-    UIWindow *key = [UIApplication sharedApplication].keyWindow;
-    if (!key) key = [UIApplication sharedApplication].windows.firstObject;
-    CGFloat inset = key ? key.safeAreaInsets.bottom : 0;
-    if (inset <= 0) inset = 34.0;
-
-    // Use the window's height, not the screen's: they match in full-screen apps
-    // but the window is what our gesture coordinates are converted against.
-    CGSize ss = [UIScreen mainScreen].bounds.size;
-    CGFloat screenH = ss.height;
-    CGFloat screenW = ss.width;
-    if (key && key.bounds.size.height > 0) {
-        screenH = key.bounds.size.height;
-        screenW = key.bounds.size.width;
-    }
-    CGFloat barH = 5.0;
-    CGFloat barW = MIN(screenW * 0.36, 154.0);
-    cached = CGRectMake((screenW - barW) / 2.0,
-                        screenH - inset + (inset - barH) / 2.0,
-                        barW, barH);
-    cachedValid = YES; cachedScreen = nowScreen;
-    SGLog(@"homeBar fallback (safeArea %.0f, window %.0fx%.0f) -> %.0f,%.0f %.0fx%.0f",
-          inset, screenW, screenH,
-          cached.origin.x, cached.origin.y, cached.size.width, cached.size.height);
-    return cached;
-}
-
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
     UIView *v = g.view;
     if (!v) return YES;
 
-    // Screen-space corner box shared by the panel swipe and the right-edge
-    // switcher, so the two can never fight over the same swipe.
+    if (!objc_getAssociatedObject(g, &kPanelPanKey)) return YES;
+    if (!gPanelEnabled) return NO;
+
+    // v1.6.6: the panel is opened by swiping LEFT from the right screen edge.
+    // The old bottom-right upward strip is gone - making SpringBoard's home
+    // gesture wait for ours killed every touch on the device.
     //
-    // For the panel pan use the point where the finger FIRST touched down, not
-    // the current point: this callback fires after ~10pt of travel, and on a
-    // shallow band that is enough to leave the zone and kill a valid swipe.
+    // Use the touch-down point: this callback fires after ~10pt of travel.
     CGPoint p = [g locationInView:v];
     SGPanelPan *pp = [g isKindOfClass:[SGPanelPan class]] ? (SGPanelPan *)g : nil;
     if (pp && pp.hasStart) p = pp.startPoint;
     UIWindow *win = v.window;
     CGPoint sp = (win ? [win convertPoint:p toWindow:nil] : p);
-    // Anchored to the black home indicator itself: every edge of the zone below
-    // comes from the bar's own frame. No edge is taken from the screen, so the
-    // zone lines up with the bar the user actually sees on any device.
-    CGFloat tolerance = MIN(MAX(gPanelBarTolerance, 0.0), 60.0);
-    CGFloat pad       = MIN(MAX(gPanelBarPad, 10.0), 80.0);
 
-    // The zone is the black bar's own rectangle, widened only by finger slack.
-    // Crucially its right edge is the BAR's right end - not the screen edge -
-    // so swiping up anywhere else on screen does not trigger anything.
-    CGRect bar = SGHomeBarRect();
-    CGFloat barL = CGRectGetMinX(bar);
-    CGFloat barR = CGRectGetMaxX(bar);
-    CGFloat barT = CGRectGetMinY(bar);
-
-    // VERTICAL extent comes entirely from the bar - that is the part the user
-    // kept reporting as wrong (it used to reach the screen edge). The strip is
-    // a thin band hugging the indicator, not the lower third of the display.
-    CGFloat zoneTop    = barT - tolerance;
-    CGFloat zoneBottom = CGRectGetMaxY(bar) + 6.0;
-
-    // HORIZONTAL extent covers the bottom-right of the screen. The indicator is
-    // only ~154pt wide and centred, while the user swipes from the bottom-right
-    // corner ~100pt to its right - anchoring the right edge to the bar's end put
-    // their finger outside the zone entirely and nothing fired.
     CGSize scr = [UIScreen mainScreen].bounds.size;
-    CGFloat zoneLeft  = MAX(barL, CGRectGetMidX(bar) - pad * 0.5);
-    CGFloat zoneRight = scr.width;
+    CGFloat edgeW = 30.0;                       // touch must start within this
+    CGFloat top   = scr.height * 0.12;          // keep clear of Control Centre
+    CGFloat bot   = scr.height * 0.88;
 
-    BOOL inCorner = (sp.x >= zoneLeft) && (sp.x <= zoneRight) &&
-                    (sp.y >= zoneTop)  && (sp.y <= zoneBottom);
-
-    // The bottom-right strip belongs to the launcher panel. Without this the
-    // right-edge recognizer wins (the corner IS the right edge) and opens the
-    // app switcher instead - exactly what the log showed.
-    if (objc_getAssociatedObject(g, &kRightEdgeKey)) {
-        if (inCorner && gPanelEnabled) {
-            SGLog(@"rightEdge vetoed in panel strip");
-            return NO;
-        }
-        return YES;
-    }
-
-    if (!objc_getAssociatedObject(g, &kPanelPanKey)) return YES;
-    SGLog(@"panelPan begin %.0f,%.0f%@ zone x[%.0f..%.0f] y[%.0f..%.0f] bar(x[%.0f..%.0f] y=%.0f h=%.0f) -> %d",
+    BOOL inZone = (sp.x >= scr.width - edgeW) && (sp.y >= top) && (sp.y <= bot);
+    SGLog(@"panelEdge begin %.0f,%.0f%@ zone x[%.0f..%.0f] y[%.0f..%.0f] -> %d",
           sp.x, sp.y, (pp && pp.hasStart) ? @"(touch-down)" : @"(current)",
-          zoneLeft, zoneRight, zoneTop, zoneBottom,
-          barL, barR, CGRectGetMinY(bar), bar.size.height, inCorner);
-    return inCorner;
+          scr.width - edgeW, scr.width, top, bot, inZone);
+    return inZone;
 }
 
 - (void)onPanelPan:(UIPanGestureRecognizer *)g {
@@ -1831,8 +1682,6 @@ static CGRect SGHomeBarRect(void) {
     static BOOL fired = NO;
     UIGestureRecognizerState st = g.state;
 
-    // clear the remembered touch-down point once the gesture is over so a stale
-    // point can never be used to judge the next swipe
     if ((st == UIGestureRecognizerStateEnded ||
          st == UIGestureRecognizerStateCancelled ||
          st == UIGestureRecognizerStateFailed) &&
@@ -1840,29 +1689,24 @@ static CGRect SGHomeBarRect(void) {
         ((SGPanelPan *)g).hasStart = NO;
     }
 
-    if (st == UIGestureRecognizerStateBegan) {
-        fired = NO;
-        return;
-    }
-    if (st != UIGestureRecognizerStateChanged && st != UIGestureRecognizerStateEnded &&
-        st != UIGestureRecognizerStateCancelled)
-        return;
+    if (st == UIGestureRecognizerStateBegan) { fired = NO; return; }
+    if (st != UIGestureRecognizerStateChanged &&
+        st != UIGestureRecognizerStateEnded &&
+        st != UIGestureRecognizerStateCancelled) return;
     if (fired) return;
 
     CGPoint t = [g translationInView:g.view];
     CGPoint vel = [g velocityInView:g.view];
 
-    // Fire as early as possible. The log showed the system home gesture
-    // cancelling our pan at ~40pt of travel, so waiting for -55 meant the
-    // panel almost never opened. 25pt (or a quick flick) beats that window.
-    BOOL upward = (t.y <= -25) || (vel.y <= -260);
-    BOOL vertical = (fabs(t.y) >= fabs(t.x) * 0.85) ||
-                    (fabs(vel.y) >= fabs(vel.x) * 0.9 && fabs(vel.y) > 200);
-    SGLog(@"panelPan state=%ld t=%.0f,%.0f v=%.0f up=%d vert=%d",
-          (long)st, t.x, t.y, vel.y, upward, vertical);
+    // leftward, and clearly more horizontal than vertical
+    BOOL leftward = (t.x <= -30) || (vel.x <= -300);
+    BOOL horizontal = (fabs(t.x) >= fabs(t.y) * 0.85) ||
+                      (fabs(vel.x) >= fabs(vel.y) * 0.9 && fabs(vel.x) > 200);
+    SGLog(@"panelEdge state=%ld t=%.0f,%.0f v=%.0f left=%d horiz=%d",
+          (long)st, t.x, t.y, vel.x, leftward, horizontal);
 
-    if (upward && vertical) {
-        fired = YES;          // latch: one swipe opens the panel once
+    if (leftward && horizontal) {
+        fired = YES;
         doPanel();
     }
 }
@@ -1952,73 +1796,6 @@ static CGRect SGHomeBarRect(void) {
 // Our pan fails instantly outside the corner box (gestureRecognizerShouldBegin
 // returns NO), so the home gesture still works everywhere else - but inside the
 // corner the panel wins.
-static void SGLatchHomeGesturePriority(void) {
-    if (!isSpringBoard() || !gPanelEnabled) return;
-    if (!gPanelPans.count) return;
-
-    NSMutableArray *ours = [NSMutableArray array];
-    for (UIGestureRecognizer *g in gPanelPans)
-        if (g) [ours addObject:g];
-    if (!ours.count) return;
-
-    NSMutableArray *targets = [NSMutableArray array];
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        // recognizers can live on the window OR on its root view
-        for (UIGestureRecognizer *g in w.gestureRecognizers)
-            if (g) [targets addObject:g];
-        for (UIGestureRecognizer *g in w.rootViewController.view.gestureRecognizers)
-            if (g) [targets addObject:g];
-    }
-
-    for (UIGestureRecognizer *g in targets) {
-        NSString *cn = NSStringFromClass([g class]);
-
-        // SpringBoard's home swipe is SBHomeGesturePanGestureRecognizer (a plain
-        // pan subclass), NOT a UIScreenEdgePanGestureRecognizer - matching on
-        // the edge class alone silently missed it, which is why nothing was
-        // ever latched. Match the class family by name, and still accept a
-        // bottom-edge recognizer for other builds.
-        // v1.6.5: "SystemGesture" matched _UISystemGestureGateGestureRecognizer,
-        // the system-wide touch gate. Making it wait for our pan blocked EVERY
-        // gesture on the device (home swipe, edge swipes, everything). Never
-        // touch gate/arbiter recognizers - only the real home-swipe ones.
-        if ([cn containsString:@"Gate"] || [cn containsString:@"Arbiter"] ||
-            [cn containsString:@"SystemGestureGate"]) continue;
-
-        BOOL isHomeSwipe = [cn containsString:@"HomeGesture"] ||
-                           [cn containsString:@"Scrunch"];
-        if (!isHomeSwipe && [g isKindOfClass:[UIScreenEdgePanGestureRecognizer class]]) {
-            UIScreenEdgePanGestureRecognizer *ep = (UIScreenEdgePanGestureRecognizer *)g;
-            isHomeSwipe = (ep.edges & UIRectEdgeBottom) != 0;
-        }
-        if (!isHomeSwipe) continue;
-        if ([g isKindOfClass:[SGPanelPan class]]) continue;
-        if (objc_getAssociatedObject(g, &kLinkedKey)) continue;
-
-        // requireGestureRecognizerToFail: needs both recognizers in the same
-        // view hierarchy, so prefer the pan that lives on this very view; fall
-        // back to the rest only if there is none.
-        NSMutableArray *ordered = [NSMutableArray array];
-        for (UIGestureRecognizer *o in ours)
-            if (o.view && g.view && o.view == g.view) [ordered addObject:o];
-        for (UIGestureRecognizer *o in ours)
-            if (![ordered containsObject:o]) [ordered addObject:o];
-
-        BOOL ok = NO;
-        for (UIGestureRecognizer *o in ordered) {
-            @try {
-                [g requireGestureRecognizerToFail:o];
-                ok = YES;
-                break;
-            } @catch (__unused NSException *e) {
-            }
-        }
-        if (ok) {
-            objc_setAssociatedObject(g, &kLinkedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            SGLog(@"home gesture (%@) now waits for panel pan", cn);
-        }
-    }
-}
 
 static void attachAllWindows(void) {
     UIApplication *app = [UIApplication sharedApplication];
@@ -2029,7 +1806,6 @@ static void attachAllWindows(void) {
     if (key) [[SGHandler shared] attachToWindow:key];
 
     // Keep re-latching: SpringBoard recreates its home gesture recognizer.
-    SGLatchHomeGesturePriority();
 }
 
 %ctor {
