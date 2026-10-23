@@ -62,14 +62,23 @@ jobs:
           rm -rf "$STAGE"
           mkdir -p "$STAGE/DEBIAN"
           mkdir -p "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries"
+          mkdir -p "$STAGE/var/jb/usr/lib/TweakInject"
 
           cp control "$STAGE/DEBIAN/control"
           cp postinst "$STAGE/DEBIAN/postinst"
           chmod 755 "$STAGE/DEBIAN/postinst"
 
+          # Install to BOTH paths so dpkg itself overwrites any stale real
+          # file that an older version left in TweakInject.  Previously only
+          # DynamicLibraries was in the deb and the postinst symlink was
+          # skipped when TweakInject already held a real file, so ellekit
+          # kept loading the OLD dylib.
           cp "$DYLIB" "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries/SquidGesture.dylib"
           cp SquidGesture_bplist.plist "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries/SquidGesture.plist"
+          cp "$DYLIB" "$STAGE/var/jb/usr/lib/TweakInject/SquidGesture.dylib"
+          cp SquidGesture_bplist.plist "$STAGE/var/jb/usr/lib/TweakInject/SquidGesture.plist"
           chmod 755 "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries/SquidGesture.dylib"
+          chmod 755 "$STAGE/var/jb/usr/lib/TweakInject/SquidGesture.dylib"
 
           dpkg-deb --build --root-owner-group "$STAGE" \
             "com.minis.squidgesture_${VERSION}_iphoneos-arm64.deb"

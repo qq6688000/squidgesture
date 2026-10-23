@@ -10,14 +10,15 @@ TI="$JB/usr/lib/TweakInject"
 
 chmod 755 "$DYLIB" 2>/dev/null || true
 
-# Always (re)sync into TweakInject. Previous builds only created a symlink
-# when the target did not exist; a real file left by an older install was
-# never replaced, so ellekit kept loading the OLD dylib from TweakInject
-# even though DynamicLibraries had the new one.
+# v1.7.3: force-copy (not symlink) the dylib and plist into TweakInject.
+# The deb also installs real files at this path now, but this cp -f is the
+# final safety net: it overwrites any stale real file left by an older
+# version that a previous postinst failed to replace.
 if [ -d "$TI" ]; then
     rm -f "$TI/SquidGesture.dylib" "$TI/SquidGesture.plist" 2>/dev/null || true
-    ln -sf "$DYLIB"  "$TI/SquidGesture.dylib" 2>/dev/null || true
-    ln -sf "$PLIST" "$TI/SquidGesture.plist" 2>/dev/null || true
+    cp -f "$DYLIB"  "$TI/SquidGesture.dylib" 2>/dev/null || true
+    cp -f "$PLIST" "$TI/SquidGesture.plist" 2>/dev/null || true
+    chmod 755 "$TI/SquidGesture.dylib" 2>/dev/null || true
 fi
 
 # Write default preferences, keeping any existing user config untouched
@@ -61,7 +62,7 @@ fi
 
 killall -9 SpringBoard 2>/dev/null || true
 
-echo "SquidGesture 1.7.2 installed."
+echo "SquidGesture 1.7.3 installed."
 echo ""
 echo "  Swipe UP starting on the black home bar -> app panel (+ to add apps)"
 echo "  Top-left 2x tap -> Lock    Top-right 2x tap -> Screenshot"
