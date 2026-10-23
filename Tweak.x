@@ -173,6 +173,8 @@ static void initSBS(void) {
 #define kNotifyPanel    "com.minis.squidgesture.action.panel"
 // 2.1.0: left-half top-bar double tap -> power menu
 #define kNotifyPower    "com.minis.squidgesture.action.power"
+// 2.4.0: screenshot must run inside SpringBoard (apps cannot capture the screen)
+#define kNotifyShot     "com.minis.squidgesture.action.screenshot"
 // Fire this from a shell to open the panel without touching the screen:
 //   notify_post com.minis.squidgesture.test.panel
 #define kNotifyTest     "com.minis.squidgesture.test.panel"
@@ -1512,6 +1514,8 @@ static void actionNotifyCb(CFNotificationCenterRef c, void *o, CFStringRef n,
                            dispatch_get_main_queue(), ^{ sbHome(); });
         } else if (CFStringCompare(n, CFSTR(kNotifyPower), 0) == kCFCompareEqualTo) {
             vibrate(); sbPowerMenu();
+        } else if (CFStringCompare(n, CFSTR(kNotifyShot), 0) == kCFCompareEqualTo) {
+            doScreenshot();
         } else if (CFStringCompare(n, CFSTR(kNotifyHide), 0) == kCFCompareEqualTo) {
             SGLog(@"force hide received");
             SGLauncherHide();
@@ -1618,73 +1622,96 @@ static void doScreenshot(void) {
     vibrate();
     SGLog(@"doScreenshot enter isSpringBoard=%d", isSpringBoard());
 
-    // iOS 15-17: the only reliable way is to ask SpringBoard to run its own
-    // screenshot service.  Do it on the main thread - it touches UI.
-    dispatch_async(dispatch_get_main_queue(), ^{
-      // 1) SpringBoardServices: SBScreenShot() C entry point (still exported)
-      void *sbs = dlopen("/System/Library/PrivateFrameworks/"
-                         "SpringBoardServices.framework/SpringBoardServices",
-                         RTLD_LAZY);
-      if (sbs) {
-          void (*shot)(void) = (void (*)(void))dlsym(sbs, "SBScreenShot");
-          if (!shot) {
-              // some builds expose the variadic variant
-              void (*shot2)(intptr_t) =
-                  (void (*)(intptr_t))dlsym(sbs, "SBScreenShotWithFlash");
-              if (shot2) { @try { shot2(1); SGLog(@"doScreenshot: SBScreenShotWithFlash OK"); return; } @catch (__unused NSException *e) {} }
-          }
-          if (shot) {
-              @try { shot(); SGLog(@"doScreenshot: SBScreenShot OK"); return; }
-              @catch (NSException *e) { SGLog(@"doScreenshot: SBScreenShot threw %@", e.reason); }
-          }
-          SGLog(@"doScreenshot: no SBS screen shot symbol");
-      }
+    // 2.4.1: only SpringBoard can capture the display. A normal app is
+    // sandboxed away from the render server, so relay through a notification.
+    if (!isSpringBoard()) {
+        notify_post(kNotifyShot);
+        return;
+    }
 
-      // 2) SBScreenShotter instance (iOS 13-16)
-      Class shotter = objc_getClass("SBScreenShotter");
-      if (shotter) {
-          SEL sh = NSSelectorFromString(@"sharedInstance");
-          id inst = [shotter respondsToSelector:sh]
-                        ? ((id(*)(id, SEL))objc_msgSend)(shotter, sh) : nil;
-          for (NSString *n in @[ @"saveScreenshotWithCompletion:", @"saveScreenshot" ]) {
-              SEL sel = NSSelectorFromString(n);
-              if (!inst || ![inst respondsToSelector:sel]) continue;
-              @try {
-                  if ([n hasSuffix:@":"])
-                      ((void(*)(id, SEL, id))objc_msgSend)(inst, sel, nil);
-                  else
-                      ((void(*)(id, SEL))objc_msgSend)(inst, sel);
-                  SGLog(@"doScreenshot: SBScreenShotter %@ OK", n);
-                  return;
-              } @catch (NSException *e) {
-                  SGLog(@"doScreenshot: %@ threw %@", n, e.reason);
-              }
-          }
-          SGLog(@"doScreenshot: SBScreenShotter unusable");
-      } else {
-          SGLog(@"doScreenshot: SBScreenShotter not found");
-      }
+    // The screenshots must be composited by the render server: capturing one
+    // UIWindow only yields that process's own layers, never the frontmost app.
+    // CARenderServerRenderDisplay asks the render server for the whole display.
+    // CARenderServerRenderDisplay(display_id, name, rect, flags)
+    // The name argument is a plain C string on modern builds.
+    typedef CGImageRef (*RenderDisplayFn)(uint32_t, CFStringRef, CGRect, int32_t);
+    static RenderDisplayFn renderDisplay = NULL;
+    static BOOL looked = NO;
+    if (!looked) {
+        looked = YES;
+        void *qc = dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore",
+                          RTLD_LAZY);
+        renderDisplay = (RenderDisplayFn)dlsym(qc ? qc : RTLD_DEFAULT,
+                                               "CARenderServerRenderDisplay");
+        SGLog(@"doScreenshot: CARenderServerRenderDisplay=%p", renderDisplay);
+    }
 
-      // 3) Simulate the hardware combo through the button coordinator.
-      Class hb = objc_getClass("SBHardwareButtonCoordinator");
-      if (!hb) hb = objc_getClass("SBScreenshotManager");
-      if (hb) {
-          id inst = nil;
-          SEL sh = NSSelectorFromString(@"sharedInstance");
-          if ([hb respondsToSelector:sh])
-              inst = ((id(*)(id, SEL))objc_msgSend)(hb, sh);
-          for (NSString *n in @[ @"takeScreenshot", @"captureScreenshot" ]) {
-              SEL sel = NSSelectorFromString(n);
-              if (inst && [inst respondsToSelector:sel]) {
-                  ((void(*)(id, SEL))objc_msgSend)(inst, sel);
-                  SGLog(@"doScreenshot: %@ -%@ OK", NSStringFromClass(hb), n);
-                  return;
-              }
-          }
-      }
+    UIScreen *scr = [UIScreen mainScreen];
+    CGRect full = scr.bounds;
+    UIImage *img = nil;
 
-      SGLog(@"doScreenshot: every path failed");
-    });
+    if (renderDisplay) {
+        @try {
+            CGImageRef cg = renderDisplay(0, (__bridge CFStringRef)@"LCD", full, 0);
+            if (cg) {
+                img = [UIImage imageWithCGImage:cg scale:scr.scale
+                                    orientation:UIImageOrientationUp];
+                CGImageRelease(cg);
+            }
+        } @catch (NSException *e) {
+            SGLog(@"doScreenshot: renderDisplay threw %@", e.reason);
+        }
+        SGLog(@"doScreenshot: renderDisplay image=%dx%d",
+              (int)img.size.width, (int)img.size.height);
+    }
+
+    if (!img) SGLog(@"doScreenshot: render server path unavailable");
+
+    if (!img) {
+        // Fallback: composite our own windows (catches SpringBoard content only,
+        // but at least proves the pipeline works).
+        UIGraphicsBeginImageContextWithOptions(full.size, NO, scr.scale);
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.hidden || w.alpha < 0.01) continue;
+            if (w.windowLevel >= 4000) continue;
+            @try { [w drawViewHierarchyInRect:full afterScreenUpdates:NO]; }
+            @catch (__unused NSException *e) { }
+        }
+        img = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        SGLog(@"doScreenshot: window fallback %dx%d",
+              (int)img.size.width, (int)img.size.height);
+    }
+
+    if (!img) { SGLog(@"doScreenshot: nothing captured"); return; }
+
+    // Write into the camera roll directly. SpringBoard runs as mobile and
+    // DCIM is mobile-owned, so a plain file write lands in Photos without
+    // needing a Photos entitlement.
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dcim = @"/var/mobile/Media/DCIM/100APPLE";
+    [fm createDirectoryAtPath:dcim withIntermediateDirectories:YES
+                   attributes:nil error:nil];
+    NSString *name = [NSString stringWithFormat:@"IMG_%.0f.JPG",
+                      [[NSDate date] timeIntervalSince1970]];
+    NSString *path = [dcim stringByAppendingPathComponent:name];
+    NSData *jpg = UIImageJPEGRepresentation(img, 0.95);
+    if (jpg && [jpg writeToFile:path atomically:YES]) {
+        SGLog(@"doScreenshot: wrote %@ (%lu bytes)", path, (unsigned long)jpg.length);
+        // Nudge Photos to index the new file.
+        notify_post("com.apple.mobileslideshow.assets.changed");
+        return;
+    }
+
+    // Last resort: keep a copy somewhere readable so the capture is not lost.
+    NSString *alt = [@"/var/mobile/Library/Preferences" stringByAppendingPathComponent:
+                     [NSString stringWithFormat:@"SquidShot-%.0f.JPG",
+                      [[NSDate date] timeIntervalSince1970]]];
+    if (jpg && [jpg writeToFile:alt atomically:YES]) {
+        SGLog(@"doScreenshot: wrote %@ (%lu bytes)", alt, (unsigned long)jpg.length);
+    } else {
+        SGLog(@"doScreenshot: write failed everywhere");
+    }
 }
 
 #pragma mark - Gesture Handler
@@ -1963,7 +1990,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.3.0 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.4.1 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
@@ -1992,6 +2019,9 @@ static void attachAllWindows(void) {
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
             CFSTR(kNotifyPower), NULL, CFNotificationSuspensionBehaviorCoalesce);
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
+            CFSTR(kNotifyShot), NULL, CFNotificationSuspensionBehaviorCoalesce);
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
             CFSTR(kNotifyPanel), NULL, CFNotificationSuspensionBehaviorCoalesce);
