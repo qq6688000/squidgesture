@@ -37,6 +37,8 @@ static BOOL gDebugLog = YES;   // v1.4.0: on by default for diagnosis
 // launcher panel
 static BOOL gPanelEnabled = YES;
 static BOOL gPanelVibrate = YES;
+static BOOL gPanelPrewarm = YES;        // preload panel apps while the panel is open
+static NSInteger gPanelPrewarmLimit = 4; // how many apps to prewarm per open
 static NSMutableArray<NSString *> *gPanelApps = nil;
 
 @class SGLauncherVC;
@@ -86,7 +88,9 @@ static void loadPrefs(void) {
     LOAD("DebugLog", gDebugLog, boolValue);
     LOAD("PanelEnabled", gPanelEnabled, boolValue);
     LOAD("PanelVibrate", gPanelVibrate, boolValue);
+    LOAD("PanelPrewarm", gPanelPrewarm, boolValue);
 #undef LOAD
+    if (p[@"PanelPrewarmLimit"]) gPanelPrewarmLimit = [p[@"PanelPrewarmLimit"] integerValue];
 
     NSArray *list = p[@"PanelApps"];
     if (!list) list = @[ @"com.apple.MobileSMS", @"com.apple.mobilesafari",
@@ -289,6 +293,51 @@ static id SGLookupWorkspace(void) {
     SEL dw = NSSelectorFromString(@"defaultWorkspace");
     if (![LSAppWorkspace respondsToSelector:dw]) return nil;
     return ((id(*)(id, SEL))objc_msgSend)(LSAppWorkspace, dw);
+}
+
+#pragma mark - Launch acceleration (prewarm)
+
+// The panel opening is a free head start: by the time the user taps a tile the
+// target app can already be booted, turning a cold start into a warm one.
+// launchApplicationWithIdentifier:suspended: loads a process without bringing it
+// to the foreground, so nothing appears on screen while we do this.
+static NSMutableDictionary<NSString *, NSNumber *> *gPrewarmAt = nil;
+static double const kPrewarmCooldown = 60.0;
+
+static void SGPrewarmPanelApps(void) {
+    if (!isSpringBoard() || !gPanelEnabled || !gPanelPrewarm) return;
+    if (!gPanelPrewarmLimit) return;
+
+    NSArray<NSString *> *apps = [gPanelApps copy];
+    if (!apps.count) return;
+    if (!gPrewarmAt) gPrewarmAt = [NSMutableDictionary dictionary];
+
+    NSInteger limit = gPanelPrewarmLimit;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+      UIApplication *app = [UIApplication sharedApplication];
+      SEL sel = NSSelectorFromString(@"launchApplicationWithIdentifier:suspended:");
+      if (![app respondsToSelector:sel]) {
+          SGLog(@"prewarm: API unavailable");
+          return;
+      }
+      NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+      NSInteger done = 0;
+      for (NSString *bid in apps) {
+          if (done >= limit) break;
+          NSNumber *last = gPrewarmAt[bid];
+          if (last && (now - last.doubleValue) < kPrewarmCooldown) continue;
+          NSTimeInterval t0 = [NSDate timeIntervalSinceReferenceDate];
+          @try {
+              ((void(*)(id, SEL, id, BOOL))objc_msgSend)(app, sel, bid, YES);
+              gPrewarmAt[bid] = @(now);
+              done++;
+              SGLog(@"prewarm %@ in %.0f ms", bid,
+                    ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0);
+          } @catch (NSException *e) {
+              SGLog(@"prewarm %@ threw %@", bid, e);
+          }
+      }
+    });
 }
 
 static BOOL SGLaunchApp(NSString *bundleID) {
@@ -1143,6 +1192,11 @@ static void SGLauncherShow(void) {
       }
 
       [gPanelVC showPanel];
+
+      // Prewarm shortly after the sheet finishes animating so it stays smooth.
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                     dispatch_get_main_queue(), ^{ SGPrewarmPanelApps(); });
+
       SGLog(@"panel shown level=%.1f vcView=%@ hidden=%d",
             (double)gPanelWindow.windowLevel, NSStringFromCGRect(gPanelVC.view.frame),
             gPanelWindow.hidden);

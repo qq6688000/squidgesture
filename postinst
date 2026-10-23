@@ -35,6 +35,8 @@ if [ ! -f "$PREFS" ]; then
     <key>VibrationFeedback</key><true/>
     <key>PanelEnabled</key><true/>
     <key>PanelVibrate</key><true/>
+    <key>PanelPrewarm</key><true/>
+    <key>PanelPrewarmLimit</key><integer>4</integer>
     <key>PanelApps</key>
     <array>
         <string>com.apple.MobileSMS</string>
@@ -52,7 +54,7 @@ fi
 
 killall -9 SpringBoard 2>/dev/null || true
 
-echo "SquidGesture 1.5.4 installed."
+echo "SquidGesture 1.5.5 installed."
 echo ""
 echo "  Swipe up from the BOTTOM-RIGHT corner -> app panel (+ to add apps)"
 echo "  Left edge swipe    -> Back        Right edge swipe -> App switcher"

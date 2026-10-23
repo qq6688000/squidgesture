@@ -1,6 +1,6 @@
 # SquidGesture
 
-系统级手势插件（rootless / Dopamine 已验证）。v1.5.1 修复**右下角上划应用面板**。
+系统级手势插件（rootless / Dopamine 已验证）。v1.5.5**右下角上划应用面板**。
 
 ## 手势列表
 
@@ -16,7 +16,7 @@
 
 所有手势触发时振动反馈。
 
-## 应用面板（v1.5.1 修复）
+## 应用面板（v1.5.5）
 
 - 从**屏幕右下角**（默认 130×210pt 的角框内）向上滑动，弹出毛玻璃面板。
 - 面板是 4 列图标网格，底栏最后一个是 **＋**：
@@ -55,6 +55,8 @@
 | ThreeFingerSwitcher | bool | YES | 三指下滑多任务 |
 | VibrationFeedback | bool | YES | 振动反馈 |
 | DebugLog | bool | YES | 调试日志（v1.4.0 起默认开） |
+| PanelPrewarm | bool | YES | 面板打开时预热应用，点击后热启动 |
+| PanelPrewarmLimit | int | 4 | 每次打开最多预热几个应用 |
 
 改完发通知刷新（不用重启）：
 
@@ -79,10 +81,27 @@ tail -50 /var/mobile/Library/Preferences/com.minis.squidgesture.log
 
 日志会记录手势坐标/速度、面板窗口创建、应用目录条数、启动结果、配置保存结果。
 
+## 启动加速
+
+面板一打开，就会在后台把面板里的应用**预先加载进内存**（`launchApplicationWithIdentifier:suspended:`，挂起态，不显示界面）。
+等你点图标时目标 App 已经是热启动，冷启动的那几秒就被面板停留的时间吃掉了。
+
+- 每个 App 有 60 秒冷却，避免反复预热同一个进程
+- 每次打开最多预热 `PanelPrewarmLimit` 个（默认 4），从面板第一格开始
+- 预热跑在后台队列，不影响面板动画
+- 关掉：`PanelPrewarm` 设为 false
+
+日志里会看到：
+
+```bash
+grep prewarm /var/mobile/Library/Preferences/com.minis.squidgesture.log
+# prewarm com.tencent.mqq in 42 ms
+```
+
 ## 安装
 
 ```bash
-dpkg -i com.minis.squidgesture_1.5.1_iphoneos-arm64.deb
+dpkg -i com.minis.squidgesture_1.5.5_iphoneos-arm64.deb
 # 或 sileo / zebra 直接装
 ```
 
