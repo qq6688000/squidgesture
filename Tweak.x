@@ -47,6 +47,7 @@ static SGLauncherVC *gPanelVC;
 static __weak UIWindow *gPanelPrevKey;
 static void SGLauncherShow(void);
 static void SGLauncherHide(void);
+static void SGLatchHomeGesturePriority(void);
 
 static __weak UIWindowScene *gCachedScene = nil;
 
@@ -1193,6 +1194,8 @@ static void SGLauncherShow(void) {
 
       [gPanelVC showPanel];
 
+      SGLatchHomeGesturePriority();
+
       // Prewarm shortly after the sheet finishes animating so it stays smooth.
       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                      dispatch_get_main_queue(), ^{ SGPrewarmPanelApps(); });
@@ -1519,6 +1522,8 @@ static void doScreenshot(void) {
 static char kAttachedKey;
 static char kPanelPanKey;
 static char kRightEdgeKey;
+static char kLinkedKey;
+static NSHashTable *gPanelPans = nil;   // weak refs to every panel pan we install
 
 @implementation SGHandler
 
@@ -1600,6 +1605,8 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         g.delaysTouchesEnded = NO;
         g.delegate = self;
         objc_setAssociatedObject(g, &kPanelPanKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (!gPanelPans) gPanelPans = [NSHashTable weakObjectsHashTable];
+        [gPanelPans addObject:g];
         [window addGestureRecognizer:g];
     }
 }
@@ -1741,6 +1748,48 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 
 #pragma mark - Constructor
 
+#pragma mark - Home-gesture priority
+
+// The region the user swipes from is the home-indicator strip, which belongs to
+// the system home gesture. Attaching our pan there is not enough: the system
+// recognizer claims the touch first and our pan is cancelled after ~40pt.
+//
+// Fix: make the system bottom-edge recognizer wait for OUR pan to fail.
+// Our pan fails instantly outside the corner box (gestureRecognizerShouldBegin
+// returns NO), so the home gesture still works everywhere else - but inside the
+// corner the panel wins.
+static void SGLatchHomeGesturePriority(void) {
+    if (!isSpringBoard() || !gPanelEnabled) return;
+    if (!gPanelPans.count) return;
+
+    NSMutableArray *ours = [NSMutableArray array];
+    for (UIGestureRecognizer *g in gPanelPans)
+        if (g) [ours addObject:g];
+    if (!ours.count) return;
+
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        for (UIGestureRecognizer *g in w.gestureRecognizers) {
+            if (![g isKindOfClass:[UIScreenEdgePanGestureRecognizer class]]) continue;
+            UIScreenEdgePanGestureRecognizer *ep = (UIScreenEdgePanGestureRecognizer *)g;
+            if (!(ep.edges & UIRectEdgeBottom)) continue;
+            if (objc_getAssociatedObject(g, &kLinkedKey)) continue;
+
+            BOOL ok = NO;
+            for (UIGestureRecognizer *o in ours) {
+                @try {
+                    [ep requireGestureRecognizerToFail:o];
+                    ok = YES;
+                } @catch (__unused NSException *e) {
+                }
+            }
+            if (ok) {
+                objc_setAssociatedObject(g, &kLinkedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                SGLog(@"home gesture now waits for panel pan");
+            }
+        }
+    }
+}
+
 static void attachAllWindows(void) {
     UIApplication *app = [UIApplication sharedApplication];
     for (UIWindow *w in app.windows) {
@@ -1748,6 +1797,9 @@ static void attachAllWindows(void) {
     }
     UIWindow *key = app.keyWindow;
     if (key) [[SGHandler shared] attachToWindow:key];
+
+    // Keep re-latching: SpringBoard recreates its home gesture recognizer.
+    SGLatchHomeGesturePriority();
 }
 
 %ctor {
