@@ -198,18 +198,12 @@ static void initSBS(void) {
 
 static void vibrate(void) {
     if (!gVibrationFeedback) return;
-    UIImpactFeedbackGenerator *gen =
-        [UIImpactFeedbackGenerator generatorWithStyle:UIImpactFeedbackStyleLight];
-    [gen prepare];
-    [gen impactOccurred];
+    AudioServicesPlaySystemSound(4095);
 }
 
 static void SGPanelVibrate(void) {
     if (!gVibrationFeedback || !gPanelVibrate) return;
-    UIImpactFeedbackGenerator *gen =
-        [UIImpactFeedbackGenerator generatorWithStyle:UIImpactFeedbackStyleMedium];
-    [gen prepare];
-    [gen impactOccurred];
+    AudioServicesPlaySystemSound(4095);
 }
 
 #pragma mark - Launcher panel : app catalog
