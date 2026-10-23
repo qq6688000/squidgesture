@@ -174,9 +174,15 @@ static void initSBS(void) {
 //   notify_post com.minis.squidgesture.test.hide
 #define kNotifyHide     "com.minis.squidgesture.test.hide"
 
-// v1.6.8: all haptic feedback removed at the user's request.
-static void vibrate(void) { }
-static void SGPanelVibrate(void) { }
+// v1.7.5: haptic feedback restored. AudioServicesPlaySystemSound(4095) is a
+// silent vibration that works on all iOS versions without needing
+// UIImpactFeedbackGenerator (which the 16.5 SDK doesn't expose correctly).
+static void vibrate(void) {
+    AudioServicesPlaySystemSound(4095);
+}
+static void SGPanelVibrate(void) {
+    AudioServicesPlaySystemSound(4095);
+}
 
 #pragma mark - Launcher panel : app catalog
 
@@ -1795,6 +1801,9 @@ static CGRect SGHomeBarRect(void) {
 
     if (st == UIGestureRecognizerStateBegan) {
         fired = NO;
+        // v1.7.5: light vibrate when the finger first touches the bar so the
+        // user knows the gesture is being tracked.
+        SGPanelVibrate();
         return;
     }
     if (st != UIGestureRecognizerStateChanged && st != UIGestureRecognizerStateEnded &&
@@ -1816,6 +1825,8 @@ static CGRect SGHomeBarRect(void) {
 
     if (upward && vertical) {
         fired = YES;          // latch: one swipe opens the panel once
+        // v1.7.5: stronger vibrate when the panel actually fires.
+        SGPanelVibrate();
         doPanel();
     }
 }
