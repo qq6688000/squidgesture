@@ -1610,7 +1610,11 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 
     // v1.6.4: left-edge back gesture removed at the user's request.
     // v1.6.4: right-edge switcher gesture removed at the user's request.
-    if (gCornerTapLock || gCornerTapScreenshot) {
+    // v1.6.5: corner tap + three-finger shortcuts are SpringBoard-only. Inside
+    // an app they forced every tap to wait for the double-tap to fail, which
+    // made touch feel dead everywhere the dylib is injected.
+    BOOL sb = isSpringBoard();
+    if (sb && (gCornerTapLock || gCornerTapScreenshot)) {
         UITapGestureRecognizer *g =
             [[UITapGestureRecognizer alloc] initWithTarget:self
                                                     action:@selector(onCornerTap:)];
@@ -1618,7 +1622,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         g.cancelsTouchesInView = NO;   // don't eat app taps
         [window addGestureRecognizer:g];
     }
-    if (gThreeFingerHome) {
+    if (sb && gThreeFingerHome) {
         UISwipeGestureRecognizer *g =
             [[UISwipeGestureRecognizer alloc] initWithTarget:self
                                                       action:@selector(onThreeFingerUp:)];
@@ -1626,7 +1630,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         g.numberOfTouchesRequired = 3; g.delegate = self;
         [window addGestureRecognizer:g];
     }
-    if (gThreeFingerSwitcher) {
+    if (sb && gThreeFingerSwitcher) {
         UISwipeGestureRecognizer *g =
             [[UISwipeGestureRecognizer alloc] initWithTarget:self
                                                       action:@selector(onThreeFingerDown:)];
@@ -1974,9 +1978,15 @@ static void SGLatchHomeGesturePriority(void) {
         // the edge class alone silently missed it, which is why nothing was
         // ever latched. Match the class family by name, and still accept a
         // bottom-edge recognizer for other builds.
+        // v1.6.5: "SystemGesture" matched _UISystemGestureGateGestureRecognizer,
+        // the system-wide touch gate. Making it wait for our pan blocked EVERY
+        // gesture on the device (home swipe, edge swipes, everything). Never
+        // touch gate/arbiter recognizers - only the real home-swipe ones.
+        if ([cn containsString:@"Gate"] || [cn containsString:@"Arbiter"] ||
+            [cn containsString:@"SystemGestureGate"]) continue;
+
         BOOL isHomeSwipe = [cn containsString:@"HomeGesture"] ||
-                           [cn containsString:@"Scrunch"] ||
-                           [cn containsString:@"SystemGesture"];
+                           [cn containsString:@"Scrunch"];
         if (!isHomeSwipe && [g isKindOfClass:[UIScreenEdgePanGestureRecognizer class]]) {
             UIScreenEdgePanGestureRecognizer *ep = (UIScreenEdgePanGestureRecognizer *)g;
             isHomeSwipe = (ep.edges & UIRectEdgeBottom) != 0;
