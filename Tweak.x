@@ -39,8 +39,8 @@ static BOOL gPanelEnabled = YES;
 static BOOL gPanelVibrate = YES;
 static BOOL gPanelPrewarm = YES;        // preload panel apps while the panel is open
 static NSInteger gPanelPrewarmLimit = 4; // how many apps to prewarm per open
-static CGFloat gPanelSwipeHeight = 120.0; // trigger strip height from the bottom edge
-static CGFloat gPanelSwipeWidth  = 200.0; // trigger strip width from the right edge
+static CGFloat gPanelBarTolerance = 28.0; // band height ABOVE the bar's top edge
+static CGFloat gPanelBarWidth     = 200.0; // zone width measured left from the right edge
 static NSMutableArray<NSString *> *gPanelApps = nil;
 
 @class SGLauncherVC;
@@ -94,8 +94,8 @@ static void loadPrefs(void) {
     LOAD("PanelPrewarm", gPanelPrewarm, boolValue);
 #undef LOAD
     if (p[@"PanelPrewarmLimit"]) gPanelPrewarmLimit = [p[@"PanelPrewarmLimit"] integerValue];
-    if (p[@"PanelSwipeHeight"]) gPanelSwipeHeight = [p[@"PanelSwipeHeight"] floatValue];
-    if (p[@"PanelSwipeWidth"]) gPanelSwipeWidth = [p[@"PanelSwipeWidth"] floatValue];
+    if (p[@"PanelBarTolerance"]) gPanelBarTolerance = [p[@"PanelBarTolerance"] floatValue];
+    if (p[@"PanelBarWidth"]) gPanelBarWidth = [p[@"PanelBarWidth"] floatValue];
 
     NSArray *list = p[@"PanelApps"];
     if (!list) list = @[ @"com.apple.MobileSMS", @"com.apple.mobilesafari",
@@ -1615,6 +1615,84 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     }
 }
 
+#pragma mark - Home indicator (the black bar) as the anchor
+
+// The trigger area must be anchored to the black home bar itself, not measured
+// up from the screen edge: the bar's height and inset vary per device, so a
+// screen-relative number never lines up with what the user actually sees.
+//
+// We look for SpringBoard's own affordance view (SBHomeGrabberView /
+// _UIHomeAffordance* / SBHomeIndicatorView) and use its real frame. If nothing
+// is found (view not loaded yet, renamed class) we fall back to the bottom
+// safe-area inset, which is exactly the bar's reserved band.
+
+static BOOL SGIsGrabberClassName(NSString *n) {
+    if (!n.length) return NO;
+    return [n containsString:@"HomeGrabber"] ||
+           [n containsString:@"HomeAffordance"] ||
+           [n containsString:@"HomeIndicator"];
+}
+
+static CGRect SGScanForGrabber(UIView *v, NSInteger depth) {
+    if (!v || v.hidden || v.alpha < 0.05 || depth > 14) return CGRectNull;
+    if (SGIsGrabberClassName(NSStringFromClass([v class]))) {
+        CGRect r = [v convertRect:v.bounds toView:nil];   // window coords
+        CGSize ss = [UIScreen mainScreen].bounds.size;
+        // Sanity: the real home bar is a short pill sitting in the bottom
+        // sliver of the screen. Anything else that happens to match the class
+        // name (there can be several grabbers) is rejected.
+        BOOL shapeOK = (r.size.width >= 60 && r.size.width <= ss.width * 0.9 &&
+                        r.size.height >= 1 && r.size.height <= 30);
+        BOOL placeOK = (r.origin.y >= ss.height * 0.85);
+        if (shapeOK && placeOK) return r;
+    }
+    for (UIView *sub in v.subviews) {
+        CGRect r = SGScanForGrabber(sub, depth + 1);
+        if (!CGRectIsNull(r)) return r;
+    }
+    return CGRectNull;
+}
+
+// Returns the black bar's rect in screen coordinates.
+static CGRect SGHomeBarRect(void) {
+    static CGRect cached = {0};
+    static BOOL cachedValid = NO;
+    static CGSize cachedScreen = {0, 0};
+
+    CGSize nowScreen = [UIScreen mainScreen].bounds.size;
+    if (cachedValid && CGSizeEqualToSize(nowScreen, cachedScreen)) return cached;
+    cachedValid = NO;
+
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        CGRect r = SGScanForGrabber(w, 0);
+        if (!CGRectIsNull(r)) {
+            r.origin.x += w.frame.origin.x;
+            r.origin.y += w.frame.origin.y;
+            if (r.size.width >= 60) {
+                cached = r; cachedValid = YES; cachedScreen = nowScreen;
+                SGLog(@"homeBar detected %.0f,%.0f %.0fx%.0f",
+                      r.origin.x, r.origin.y, r.size.width, r.size.height);
+                return cached;
+            }
+        }
+    }
+
+    // Fallback: the bar lives inside the bottom safe-area band.
+    UIWindow *key = [UIApplication sharedApplication].keyWindow;
+    CGFloat inset = key ? key.safeAreaInsets.bottom : 34.0;
+    if (inset <= 0) inset = 34.0;
+    CGSize ss = [UIScreen mainScreen].bounds.size;
+    CGFloat barH = 5.0;
+    CGFloat barW = MIN(ss.width * 0.36, 154.0);
+    cached = CGRectMake((ss.width - barW) / 2.0,
+                        ss.height - inset + (inset - barH) / 2.0,
+                        barW, barH);
+    cachedValid = YES; cachedScreen = nowScreen;
+    SGLog(@"homeBar fallback (safeArea %.0f) -> %.0f,%.0f %.0fx%.0f",
+          inset, cached.origin.x, cached.origin.y, cached.size.width, cached.size.height);
+    return cached;
+}
+
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
     UIView *v = g.view;
     if (!v) return YES;
@@ -1625,12 +1703,27 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     UIWindow *win = v.window;
     CGPoint sp = (win ? [win convertPoint:p toWindow:nil] : p);
     CGSize screen = [UIScreen mainScreen].bounds.size;
-    // A shallow strip hugging the very bottom edge (the home indicator), NOT a
-    // tall quadrant. Measured from the bottom so it tracks the indicator on any
-    // device. Capped so a large CornerSize value can't balloon it again.
-    CGFloat boxW = MIN(MAX(gPanelSwipeWidth, 120.0), 280.0);
-    CGFloat boxH = MIN(MAX(gPanelSwipeHeight, 60.0), 160.0);
-    BOOL inCorner = (sp.x > screen.width - boxW) && (sp.y > screen.height - boxH);
+    // Anchored to the black home bar itself: the swipe must START on the bar (or
+    // within PanelSwipeAboveBar points just above it) and in its right half,
+    // running out to the screen edge. Nothing is measured from the screen edge,
+    // so the zone lines up with the bar the user actually sees on any device.
+    CGFloat boxW      = MIN(MAX(gPanelBarWidth, 120.0), 280.0);
+    CGFloat tolerance = MIN(MAX(gPanelBarTolerance, 0.0), 60.0);
+
+    // Everything below is derived from the black bar's own rect - nothing is
+    // measured from the screen edge. The handsets put that bar ~134x5pt,
+    // centred, ~21pt above the bottom; using its real frame keeps the zone
+    // lined up with the pixels the user sees.
+    CGRect bar = SGHomeBarRect();
+    CGFloat zoneTop    = CGRectGetMinY(bar) - tolerance; // just above the bar
+    CGFloat zoneBottom = screen.height;                 // down past the bar
+    CGFloat zoneRight  = screen.width;                  // out to the right edge
+    // Must always include the bar's right end so a swipe starting on the bar
+    // itself registers, but never reach further left than PanelBarWidth.
+    CGFloat zoneLeft   = MIN(screen.width - boxW, CGRectGetMaxX(bar) - 20.0);
+
+    BOOL inCorner = (sp.x >= zoneLeft) && (sp.x <= zoneRight) &&
+                    (sp.y >= zoneTop)  && (sp.y <= zoneBottom);
 
     // The bottom-right strip belongs to the launcher panel. Without this the
     // right-edge recognizer wins (the corner IS the right edge) and opens the
@@ -1644,8 +1737,9 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     }
 
     if (!objc_getAssociatedObject(g, &kPanelPanKey)) return YES;
-    SGLog(@"panelPan begin %.0f,%.0f strip %.0fx%.0f (from bottom %.0f pt) -> %d",
-          sp.x, sp.y, boxW, boxH, gPanelSwipeHeight, inCorner);
+    SGLog(@"panelPan begin %.0f,%.0f zone x[%.0f..%.0f] y[%.0f..%.0f] bar(y=%.0f h=%.0f) -> %d",
+          sp.x, sp.y, zoneLeft, zoneRight, zoneTop, zoneBottom,
+          CGRectGetMinY(bar), bar.size.height, inCorner);
     return inCorner;
 }
 
