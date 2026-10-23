@@ -1,12 +1,25 @@
 #!/bin/sh
-# preinst: runs BEFORE dpkg unpacks files.  Remove any stale real file OR
-# symlink that an older version left in TweakInject, so dpkg can install
-# the new real file cleanly instead of following a dangling symlink.
+# preinst: runs BEFORE dpkg unpacks files.
+#
+# The device had a self-referential symlink:
+#   DynamicLibraries/SquidGesture.dylib -> .../DynamicLibraries/SquidGesture.dylib
+# dpkg refuses to write through it, so every install since 1.7.3 failed
+# silently and dpkg -l stayed at 1.7.2.  Remove any symlink (or stale real
+# file) at both managed paths so dpkg can create clean real files.
 JB=/var/jb
 [ -d "$JB" ] || JB=""
+
+DL="$JB/Library/MobileSubstrate/DynamicLibraries"
 TI="$JB/usr/lib/TweakInject"
-if [ -d "$TI" ]; then
-    rm -rf "$TI/SquidGesture.dylib"  2>/dev/null || true
-    rm -rf "$TI/SquidGesture.plist"  2>/dev/null || true
-fi
+
+for d in "$DL" "$TI"; do
+    [ -d "$d" ] || continue
+    for f in SquidGesture.dylib SquidGesture.plist; do
+        p="$d/$f"
+        if [ -L "$p" ]; then
+            # a symlink: drop it, dpkg will write the real file
+            rm -f "$p" 2>/dev/null || true
+        fi
+    done
+done
 exit 0

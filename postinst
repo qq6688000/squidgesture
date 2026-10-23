@@ -10,15 +10,13 @@ TI="$JB/usr/lib/TweakInject"
 
 chmod 755 "$DYLIB" 2>/dev/null || true
 
-# v1.7.3: force-copy (not symlink) the dylib and plist into TweakInject.
-# The deb also installs real files at this path now, but this cp -f is the
-# final safety net: it overwrites any stale real file left by an older
-# version that a previous postinst failed to replace.
-if [ -d "$TI" ]; then
+# Same as the working 1.5.9 layout: the real file lives in DynamicLibraries
+# and TweakInject gets a symlink to it.  Always recreate the link (rm first)
+# so a stale real file from an older build can never shadow it.
+if [ -d "$TI" ] && [ -f "$DYLIB" ]; then
     rm -f "$TI/SquidGesture.dylib" "$TI/SquidGesture.plist" 2>/dev/null || true
-    cp -f "$DYLIB"  "$TI/SquidGesture.dylib" 2>/dev/null || true
-    cp -f "$PLIST" "$TI/SquidGesture.plist" 2>/dev/null || true
-    chmod 755 "$TI/SquidGesture.dylib" 2>/dev/null || true
+    ln -sf "$DYLIB"  "$TI/SquidGesture.dylib" 2>/dev/null || true
+    ln -sf "$PLIST"  "$TI/SquidGesture.plist" 2>/dev/null || true
 fi
 
 # Write default preferences, keeping any existing user config untouched
@@ -62,7 +60,7 @@ fi
 
 killall -9 SpringBoard 2>/dev/null || true
 
-echo "SquidGesture 1.7.5 installed."
+echo "SquidGesture 1.5.9r installed."
 echo ""
 echo "  Swipe UP starting on the black home bar -> app panel (+ to add apps)"
 echo "  Top-left 2x tap -> Lock    Top-right 2x tap -> Screenshot"

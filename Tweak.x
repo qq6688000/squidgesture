@@ -174,14 +174,12 @@ static void initSBS(void) {
 //   notify_post com.minis.squidgesture.test.hide
 #define kNotifyHide     "com.minis.squidgesture.test.hide"
 
-// v1.7.5: haptic feedback restored. AudioServicesPlaySystemSound(4095) is a
-// silent vibration that works on all iOS versions without needing
-// UIImpactFeedbackGenerator (which the 16.5 SDK doesn't expose correctly).
 static void vibrate(void) {
-    AudioServicesPlaySystemSound(4095);
+    if (gVibrationFeedback) AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
 }
+
 static void SGPanelVibrate(void) {
-    AudioServicesPlaySystemSound(4095);
+    if (gPanelVibrate) AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
 }
 
 #pragma mark - Launcher panel : app catalog
@@ -533,15 +531,11 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGFloat w = self.bounds.size.width;
-    CGFloat h = self.bounds.size.height;
-    CGFloat iconSize = MIN(w - 20, 46.0);
-    if (iconSize < 24) iconSize = MIN(w - 8, 38.0);
-    CGFloat offY = (h - iconSize - 16) / 2;
-    _iconView.frame = CGRectMake((w - iconSize) / 2, offY, iconSize, iconSize);
+    CGFloat iconSize = MIN(w - 6, 60.0);
+    _iconView.frame = CGRectMake((w - iconSize) / 2, 0, iconSize, iconSize);
     _iconView.layer.cornerRadius = iconSize * 0.225;
-    _nameLabel.frame = CGRectMake(4, offY + iconSize + 2, w - 8, 14);
-    _nameLabel.textAlignment = NSTextAlignmentCenter;
-    _removeBtn.frame = CGRectMake(0, 0, 22, 22);
+    _nameLabel.frame = CGRectMake(-4, iconSize + 5, w + 8, 13);
+    _removeBtn.frame = CGRectMake(_iconView.frame.origin.x - 6, -6, 22, 22);
 }
 
 - (void)setHighlighted:(BOOL)highlighted {
@@ -597,15 +591,13 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
 
     _titleLabel = [[UILabel alloc] init];
     _titleLabel.text = @"应用";
-    _titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-    _titleLabel.textAlignment = NSTextAlignmentCenter;
+    _titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
     _titleLabel.textColor = [UIColor whiteColor];
     [_sheet addSubview:_titleLabel];
 
     _editBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     [_editBtn setTitle:@"编辑" forState:UIControlStateNormal];
-    _editBtn.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-    _editBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
+    _editBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
     [_editBtn setTitleColor:[UIColor colorWithRed:0.35 green:0.62 blue:1.0 alpha:1.0]
                    forState:UIControlStateNormal];
     [_editBtn addTarget:self action:@selector(toggleEdit) forControlEvents:UIControlEventTouchUpInside];
@@ -624,7 +616,7 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
     [_sheet addSubview:_scroll];
 
     _emptyLabel = [[UILabel alloc] init];
-    _emptyLabel.text = @"还没有应用\n点底部 ＋ 添加";
+    _emptyLabel.text = @"还没有应用\n点右下角 ＋ 添加";
     _emptyLabel.numberOfLines = 0;
     _emptyLabel.textAlignment = NSTextAlignmentCenter;
     _emptyLabel.font = [UIFont systemFontOfSize:13];
@@ -646,8 +638,8 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
     _table.dataSource = self;
     _table.delegate = self;
     _table.hidden = YES;
-    _table.rowHeight = 44;
-    _table.contentInset = UIEdgeInsetsMake(0, 0, 16, 0);
+    _table.rowHeight = 54;
+    _table.contentInset = UIEdgeInsetsMake(0, 0, 20, 0);
     [_sheet addSubview:_table];
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self
@@ -676,39 +668,38 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     if (s.width < 10 || s.height < 10) s = [UIScreen mainScreen].bounds.size;
     if (s.width < 10) return;
 
-    CGFloat panelW = 126;
-    CGFloat pad = 10;
-    CGFloat headerH = 54;
-    CGFloat maxH = s.height * 0.88;
+    CGFloat margin = 14;
+    CGFloat w = s.width - margin * 2;
+    CGFloat headerH = 46;
+    CGFloat maxH = s.height * 0.74;
     CGFloat contentH;
 
     if (_pickerMode) {
         contentH = maxH;
     } else {
+        NSInteger cols = 4;
         NSInteger n = [self panelItems].count + 1;
-        CGFloat rowH = 78;
-        CGFloat addRowH = 54;
-        contentH = headerH + n * rowH + addRowH + 10;
-        contentH = MAX(MIN(contentH, maxH), headerH + rowH + 40);
+        NSInteger rows = MAX(1, (n + cols - 1) / cols);
+        CGFloat tileW = (w - 32 - 12 * (cols - 1)) / cols;
+        CGFloat rowH = (tileW - 6) + 5 + 13;
+        contentH = headerH + 20 + rows * (rowH + 14) + 8;
+        contentH = MAX(MIN(contentH, maxH), headerH + 96);
     }
 
-    // Right-side vertical strip, vertically centered.
-    _sheet.frame = CGRectMake(s.width - panelW, (s.height - contentH) / 2.0,
-                              panelW, contentH);
-    _sheet.layer.cornerRadius = 24;
+    _sheet.frame = CGRectMake(margin, s.height - contentH - 22, w, contentH);
 
-    CGFloat innerW = panelW - pad * 2;
-    _titleLabel.frame = CGRectMake(pad, 8, innerW - 30, 22);
-    _closeBtn.frame = CGRectMake(panelW - pad - 28, 6, 28, 28);
-    _editBtn.frame = CGRectMake(pad, 30, innerW, 22);
+    CGFloat pad = 16;
+    _titleLabel.frame = CGRectMake(pad, 13, 140, 22);
+    _closeBtn.frame = CGRectMake(w - pad - 34, 9, 34, 30);
+    _editBtn.frame = CGRectMake(w - pad - 34 - 56, 9, 56, 30);
 
     CGFloat top = headerH;
     if (_pickerMode) {
-        _table.frame = CGRectMake(0, top, panelW, contentH - top);
+        _table.frame = CGRectMake(0, top, w, contentH - top);
     } else {
-        _scroll.frame = CGRectMake(0, top, panelW, contentH - top);
+        _scroll.frame = CGRectMake(0, top, w, contentH - top);
     }
-    _emptyLabel.frame = CGRectMake(pad, (contentH - 48) / 2, innerW, 48);
+    _emptyLabel.frame = CGRectMake(pad, (contentH - 60) / 2, w - pad * 2, 60);
     _loadingLabel.frame = _emptyLabel.frame;
 
     [self layoutGrid];
@@ -747,28 +738,29 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     CGFloat w = _sheet.bounds.size.width;
     if (w < 10) return;
 
-    CGFloat pad = 10, gap = 6;
-    CGFloat tileW = w - pad * 2;
-    CGFloat tileH = 78;
-    CGFloat addTileH = 52;
-    NSInteger total = items.count + 1;
+    NSInteger cols = 4;
+    CGFloat pad = 16, gap = 12;
+    CGFloat tileW = (w - pad * 2 - gap * (cols - 1)) / cols;
+    CGFloat tileH = (tileW - 6) + 5 + 13;
 
-    CGFloat y = 8;
+    NSInteger total = items.count + 1;
+    NSInteger rows = (total + cols - 1) / cols;
+
     for (NSInteger i = 0; i < total; i++) {
         BOOL isAdd = (i == (NSInteger)items.count);
-        CGFloat h = isAdd ? addTileH : tileH;
-        CGRect f = CGRectMake(pad, y, tileW, h);
+        NSInteger r = i / cols, c = i % cols;
+        CGRect f = CGRectMake(pad + c * (tileW + gap), 10 + r * (tileH + 14), tileW, tileH);
 
         SGTile *tile = [[SGTile alloc] initWithFrame:f];
         if (isAdd) {
             tile.addTile = YES;
-            tile.iconView.image = [self plusIcon:40];
+            tile.iconView.image = [self plusIcon:60];
             tile.iconView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
-            tile.nameLabel.text = @"添加应用";
+            tile.nameLabel.text = @"添加";
         } else {
             SGCatalogItem *it = items[i];
             tile.item = it;
-            CGFloat iconSize = MIN(tileW - 16, 44.0);
+            CGFloat iconSize = MIN(tileW - 6, 60.0);
             tile.iconView.image = SGIconQuick(it, CGSizeMake(iconSize, iconSize));
             tile.nameLabel.text = it.name ?: it.bundleID;
             tile.removeBtn.hidden = !_editing;
@@ -778,10 +770,9 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         }
         [tile addTarget:self action:@selector(tileTapped:) forControlEvents:UIControlEventTouchUpInside];
         [_scroll addSubview:tile];
-        y += h + gap;
     }
 
-    _scroll.contentSize = CGSizeMake(w, y - gap + 8);
+    _scroll.contentSize = CGSizeMake(w, 10 + rows * (tileH + 14) + 8);
     _emptyLabel.hidden = (items.count != 0) || _catalog != nil;
 
     // upgrade placeholders to real icons off the main thread
@@ -929,9 +920,9 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         cell.backgroundColor = [UIColor clearColor];
         cell.textLabel.textColor = [UIColor whiteColor];
         cell.detailTextLabel.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
-        cell.textLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
-        cell.detailTextLabel.font = [UIFont systemFontOfSize:8.5];
-        cell.imageView.layer.cornerRadius = 7;
+        cell.textLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+        cell.detailTextLabel.font = [UIFont systemFontOfSize:10.5];
+        cell.imageView.layer.cornerRadius = 9;
         cell.imageView.layer.cornerCurve = kCACornerCurveContinuous;
         cell.imageView.clipsToBounds = YES;
     }
@@ -977,13 +968,13 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 - (void)onSheetPan:(UIPanGestureRecognizer *)g {
     CGPoint t = [g translationInView:self.view];
     if (g.state == UIGestureRecognizerStateChanged) {
-        CGFloat dx = MAX(0, t.x);
-        _sheet.transform = CGAffineTransformMakeTranslation(dx, 0);
-        _backdrop.alpha = MAX(0.1, 1.0 - dx / 140.0);
+        CGFloat dy = MAX(0, t.y);
+        _sheet.transform = CGAffineTransformMakeTranslation(0, dy);
+        _backdrop.alpha = MAX(0.1, 1.0 - dy / 240.0);
     } else if (g.state == UIGestureRecognizerStateEnded ||
                g.state == UIGestureRecognizerStateCancelled) {
-        CGFloat v = [g velocityInView:self.view].x;
-        if (t.x > 80 || v > 550) {
+        CGFloat v = [g velocityInView:self.view].y;
+        if (t.y > 110 || v > 700) {
             [self hidePanel];
         } else {
             [UIView animateWithDuration:0.22
@@ -1021,7 +1012,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     }
 
     _backdrop.alpha = 0;
-    _sheet.transform = CGAffineTransformMakeTranslation(_sheet.bounds.size.width + 40, 0);
+    _sheet.transform = CGAffineTransformMakeTranslation(0, _sheet.bounds.size.height + 40);
     [UIView animateWithDuration:0.30
                           delay:0
          usingSpringWithDamping:0.92
@@ -1038,7 +1029,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 // left on screen while the app is being activated.
 - (void)hidePanelNow {
     self.view.userInteractionEnabled = NO;
-    _sheet.transform = CGAffineTransformMakeTranslation(_sheet.bounds.size.width + 40, 0);
+    _sheet.transform = CGAffineTransformMakeTranslation(0, _sheet.bounds.size.height + 40);
     _backdrop.alpha = 0;
     SGLauncherHide();
 }
@@ -1052,7 +1043,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
           SGLauncherVC *s = weakSelf;
           if (!s) return;
           s->_sheet.transform =
-              CGAffineTransformMakeTranslation(s->_sheet.bounds.size.width + 40, 0);
+              CGAffineTransformMakeTranslation(0, s->_sheet.bounds.size.height + 40);
           s->_backdrop.alpha = 0;
         }
         completion:^(BOOL f) {
@@ -1589,14 +1580,22 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     SGLog(@"attach to window %@ level=%.1f", NSStringFromClass([window class]),
           (double)window.windowLevel);
 
-    // v1.6.8: corner-tap and three-finger shortcuts are SpringBoard-only. Inside
-    // an app they made every single tap wait for a double-tap to fail, so touch
-    // felt dead everywhere the dylib is injected.
-    BOOL sb = isSpringBoard();
-
-    // v1.6.8: left-edge back and right-edge switcher recognisers removed. They
-    // fought with the panel swipe and with each app's own edge gestures.
-    if (sb && (gCornerTapLock || gCornerTapScreenshot)) {
+    if (gLeftEdgeBack) {
+        UIScreenEdgePanGestureRecognizer *g =
+            [[UIScreenEdgePanGestureRecognizer alloc]
+                initWithTarget:self action:@selector(onLeftPan:)];
+        g.edges = UIRectEdgeLeft; g.delegate = self;
+        [window addGestureRecognizer:g];
+    }
+    if (gRightEdgeSwitcher) {
+        UIScreenEdgePanGestureRecognizer *g =
+            [[UIScreenEdgePanGestureRecognizer alloc]
+                initWithTarget:self action:@selector(onRightPan:)];
+        g.edges = UIRectEdgeRight; g.delegate = self;
+        objc_setAssociatedObject(g, &kRightEdgeKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [window addGestureRecognizer:g];
+    }
+    if (gCornerTapLock || gCornerTapScreenshot) {
         UITapGestureRecognizer *g =
             [[UITapGestureRecognizer alloc] initWithTarget:self
                                                     action:@selector(onCornerTap:)];
@@ -1604,7 +1603,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         g.cancelsTouchesInView = NO;   // don't eat app taps
         [window addGestureRecognizer:g];
     }
-    if (sb && gThreeFingerHome) {
+    if (gThreeFingerHome) {
         UISwipeGestureRecognizer *g =
             [[UISwipeGestureRecognizer alloc] initWithTarget:self
                                                       action:@selector(onThreeFingerUp:)];
@@ -1612,7 +1611,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         g.numberOfTouchesRequired = 3; g.delegate = self;
         [window addGestureRecognizer:g];
     }
-    if (sb && gThreeFingerSwitcher) {
+    if (gThreeFingerSwitcher) {
         UISwipeGestureRecognizer *g =
             [[UISwipeGestureRecognizer alloc] initWithTarget:self
                                                       action:@selector(onThreeFingerDown:)];
@@ -1633,8 +1632,6 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         if (!gPanelPans) gPanelPans = [NSHashTable weakObjectsHashTable];
         [gPanelPans addObject:g];
         [window addGestureRecognizer:g];
-        SGLog(@"panelEdge recognizer attached to %@ level=%.1f",
-              NSStringFromClass([window class]), (double)window.windowLevel);
     }
 }
 
@@ -1669,11 +1666,7 @@ static CGRect SGScanForGrabber(UIView *v, NSInteger depth) {
         BOOL shapeOK = (r.size.width >= 60 && r.size.width <= ss.width * 0.9 &&
                         r.size.height >= 1 && r.size.height <= 30);
         BOOL placeOK = (r.origin.y >= ss.height * 0.85);
-        // v1.6.8: reject off-centre hits. A grabber whose centre is far from the
-        // screen centre is a different affordance, and using its rect shifted the
-        // whole zone sideways (the log showed bar centre 292 on a 430pt screen).
-        BOOL centred = (fabs(CGRectGetMidX(r) - ss.width / 2.0) <= ss.width * 0.12);
-        if (shapeOK && placeOK && centred) return r;
+        if (shapeOK && placeOK) return r;
     }
     for (UIView *sub in v.subviews) {
         CGRect r = SGScanForGrabber(sub, depth + 1);
@@ -1749,18 +1742,13 @@ static CGRect SGHomeBarRect(void) {
     // measured from the screen edge. The handsets put that bar ~134x5pt,
     // centred, ~21pt above the bottom; using its real frame keeps the zone
     // lined up with the pixels the user sees.
-    // v1.6.8 (1.6.3 geometry): the two axes are modelled separately.
-    //  - vertical  : strictly from the bar's own frame (the user's complaint was
-    //                that it was measured from the SCREEN bottom instead)
-    //  - horizontal: from the bar's centre out to the screen's right edge, which
-    //                is the bottom-right corner the thumb actually lands on.
-    // Binding the right edge to bar.maxX excluded every real swipe.
     CGRect bar = SGHomeBarRect();
-    CGFloat barMid     = CGRectGetMidX(bar);
-    CGFloat zoneTop    = CGRectGetMinY(bar) - tolerance;
-    CGFloat zoneBottom = CGRectGetMaxY(bar) + 6.0;
-    CGFloat zoneLeft   = MAX(CGRectGetMinX(bar), barMid - boxW / 2.0);
-    CGFloat zoneRight  = screen.width;
+    CGFloat zoneTop    = CGRectGetMinY(bar) - tolerance; // just above the bar
+    CGFloat zoneBottom = screen.height;                 // down past the bar
+    CGFloat zoneRight  = screen.width;                  // out to the right edge
+    // Must always include the bar's right end so a swipe starting on the bar
+    // itself registers, but never reach further left than PanelBarWidth.
+    CGFloat zoneLeft   = MIN(screen.width - boxW, CGRectGetMaxX(bar) - 20.0);
 
     BOOL inCorner = (sp.x >= zoneLeft) && (sp.x <= zoneRight) &&
                     (sp.y >= zoneTop)  && (sp.y <= zoneBottom);
@@ -1801,9 +1789,6 @@ static CGRect SGHomeBarRect(void) {
 
     if (st == UIGestureRecognizerStateBegan) {
         fired = NO;
-        // v1.7.5: light vibrate when the finger first touches the bar so the
-        // user knows the gesture is being tracked.
-        SGPanelVibrate();
         return;
     }
     if (st != UIGestureRecognizerStateChanged && st != UIGestureRecognizerStateEnded &&
@@ -1825,8 +1810,6 @@ static CGRect SGHomeBarRect(void) {
 
     if (upward && vertical) {
         fired = YES;          // latch: one swipe opens the panel once
-        // v1.7.5: stronger vibrate when the panel actually fires.
-        SGPanelVibrate();
         doPanel();
     }
 }
@@ -1942,13 +1925,10 @@ static void SGLatchHomeGesturePriority(void) {
         // the edge class alone silently missed it, which is why nothing was
         // ever latched. Match the class family by name, and still accept a
         // bottom-edge recognizer for other builds.
-        // v1.6.8: never latch a "system gesture" gate/arbiter. The 1.5.9 code
-        // matched "SystemGesture", which hit _UISystemGestureGateGestureRecognizer
-        // - the device-wide touch gate. Making it wait for our pan suspended
-        // EVERY touch on the phone.
+        // Never latch a device-wide touch gate. Matching "SystemGesture" hit
+        // _UISystemGestureGateGestureRecognizer and suspended every touch.
         if ([cn containsString:@"Gate"] || [cn containsString:@"Arbiter"] ||
             [cn containsString:@"SystemGestureGate"]) continue;
-
         BOOL isHomeSwipe = [cn containsString:@"HomeGesture"] ||
                            [cn containsString:@"Scrunch"];
         if (!isHomeSwipe && [g isKindOfClass:[UIScreenEdgePanGestureRecognizer class]]) {
@@ -1997,33 +1977,24 @@ static void attachAllWindows(void) {
 }
 
 %ctor {
-    // Filter is Mode = Any, so this dylib lands in daemons too. Touching UIKit
-    // from a non-UI process crashes it, so bail out before anything else.
+    // Filter is Bundles-limited, but guard anyway: touching UIKit from a
+    // non-UI process crashes it.
     if (!NSClassFromString(@"UIApplication") ||
         !NSClassFromString(@"UIWindow")) {
         return;
     }
     loadPrefs();
-    // v1.6.9: never let a stale DebugLog=false in the preferences file hide the
-    // load marker. That key is read from disk, and an old profile would silently
-    // swallow every log line, making "not loaded" and "loaded but broken"
-    // indistinguishable.
     gDebugLog = YES;
-    // Independent marker written straight to the container/Preferences path -
-    // it does not go through the debug switch at all, so it answers "did the
-    // dylib load?" even if everything else is misconfigured.
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 1.6.9 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 1.5.9r sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
             : [[NSSearchPathForDirectoriesInDomains(NSLibraryDirectory,
                 NSUserDomainMask, YES) firstObject]
                 stringByAppendingPathComponent:@"com.minis.squidgesture.loaded"];
-        [m writeToFile:path atomically:YES encoding:NSUTF8StringEncoding
-                 error:nil];
+        [m writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     } @catch (__unused NSException *e) { }
-    SGLog(@"=== SquidGesture 1.6.9 loaded (sb=%d) ===", (int)isSpringBoard());
     initSBS();
 
     CFNotificationCenterAddObserver(
