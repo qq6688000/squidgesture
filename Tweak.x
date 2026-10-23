@@ -10,6 +10,7 @@
 //     high-level windows, not the key window), and hook makeKeyWindow/
 //     makeKeyAndVisible/becomeKeyWindow.
 
+#import <unistd.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -1983,7 +1984,26 @@ static void attachAllWindows(void) {
         return;
     }
     loadPrefs();
-    SGLog(@"=== SquidGesture 1.6.8 loaded (sb=%d) ===", (int)isSpringBoard());
+    // v1.6.9: never let a stale DebugLog=false in the preferences file hide the
+    // load marker. That key is read from disk, and an old profile would silently
+    // swallow every log line, making "not loaded" and "loaded but broken"
+    // indistinguishable.
+    gDebugLog = YES;
+    // Independent marker written straight to the container/Preferences path -
+    // it does not go through the debug switch at all, so it answers "did the
+    // dylib load?" even if everything else is misconfigured.
+    @try {
+        NSString *m = [NSString stringWithFormat:@"loaded 1.6.9 sb=%d pid=%d %@\n",
+                       (int)isSpringBoard(), (int)getpid(), [NSDate date]];
+        NSString *path = isSpringBoard()
+            ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
+            : [[NSSearchPathForDirectoriesInDomains(NSLibraryDirectory,
+                NSUserDomainMask, YES) firstObject]
+                stringByAppendingPathComponent:@"com.minis.squidgesture.loaded"];
+        [m writeToFile:path atomically:YES encoding:NSUTF8StringEncoding
+                 error:nil];
+    } @catch (__unused NSException *e) { }
+    SGLog(@"=== SquidGesture 1.6.9 loaded (sb=%d) ===", (int)isSpringBoard());
     initSBS();
 
     CFNotificationCenterAddObserver(
