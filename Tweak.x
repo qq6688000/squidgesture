@@ -509,6 +509,7 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
 @property (nonatomic, assign) BOOL pickerMode;
 - (void)showPanel;
 - (void)hidePanel;
+- (void)hidePanelNow;
 @end
 
 @implementation SGLauncherVC
@@ -747,22 +748,28 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     SGCatalogItem *it = tile.item;
     SGPanelVibrate();
     NSString *bid = it.bundleID;
-    [self hidePanel];
+    [self hidePanelNow];
     // Give SpringBoard a couple of runloop turns after the window is hidden and
     // key status is restored - activating an app mid-transition is what made
     // the screen hang for 3-5 seconds.
     if (bid.length) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+        // openApplicationWithBundleID: BLOCKS until the app is activated - the
+        // log measured 10039 ms on a cold start. Never call it on the main
+        // thread or SpringBoard (and the whole screen) freezes for that long.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-                         NSTimeInterval t0 = [NSDate timeIntervalSinceReferenceDate];
-                         BOOL ok = NO;
-                         @try {
-                             ok = SGLaunchApp(bid);
-                         } @catch (NSException *e) {
-                             SGLog(@"launch %@ threw %@", bid, e);
-                         }
-                         SGLog(@"launch %@ done ok=%d in %.0f ms", bid, ok,
-                               ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0);
+                         dispatch_async(
+                             dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                               NSTimeInterval t0 = [NSDate timeIntervalSinceReferenceDate];
+                               BOOL ok = NO;
+                               @try {
+                                   ok = SGLaunchApp(bid);
+                               } @catch (NSException *e) {
+                                   SGLog(@"launch %@ threw %@", bid, e);
+                               }
+                               SGLog(@"launch %@ done ok=%d in %.0f ms", bid, ok,
+                                     ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0);
+                             });
                        });
     }
 }
@@ -961,6 +968,15 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
                        self->_sheet.transform = CGAffineTransformIdentity;
                      }
                      completion:nil];
+}
+
+// Instant close: no animation. Used when launching, so no high-level window is
+// left on screen while the app is being activated.
+- (void)hidePanelNow {
+    self.view.userInteractionEnabled = NO;
+    _sheet.transform = CGAffineTransformMakeTranslation(0, _sheet.bounds.size.height + 40);
+    _backdrop.alpha = 0;
+    SGLauncherHide();
 }
 
 - (void)hidePanel {
