@@ -1742,13 +1742,21 @@ static CGRect SGHomeBarRect(void) {
     // measured from the screen edge. The handsets put that bar ~134x5pt,
     // centred, ~21pt above the bottom; using its real frame keeps the zone
     // lined up with the pixels the user sees.
+    // 1.5.9t: the zone must contain the WHOLE black bar.
+    //
+    // The device log showed a touch-down at x=205, y=902 - right on the bar
+    // (bar spans ~x[138..292]) - being rejected because zoneLeft was derived
+    // from `screen.width - boxW` (430-200 = 230).  That cut away the entire
+    // left half of the bar, so most swipes starting on the bar fell outside.
+    // Anchor every edge to the bar's own frame instead.
     CGRect bar = SGHomeBarRect();
-    CGFloat zoneTop    = CGRectGetMinY(bar) - tolerance; // just above the bar
-    CGFloat zoneBottom = screen.height;                 // down past the bar
-    CGFloat zoneRight  = screen.width;                  // out to the right edge
-    // Must always include the bar's right end so a swipe starting on the bar
-    // itself registers, but never reach further left than PanelBarWidth.
-    CGFloat zoneLeft   = MIN(screen.width - boxW, CGRectGetMaxX(bar) - 20.0);
+    // Generous vertical band: the user starts anywhere on/above the bar and
+    // drags up, so the zone has to cover the bar plus a good chunk above it.
+    CGFloat zoneTop    = CGRectGetMinY(bar) - 120.0;
+    CGFloat zoneBottom = screen.height;
+    CGFloat zoneLeft   = CGRectGetMinX(bar) - 40.0;            // whole bar + slack
+    CGFloat zoneRight  = screen.width;                          // out to the edge
+    (void)boxW;
 
     BOOL inCorner = (sp.x >= zoneLeft) && (sp.x <= zoneRight) &&
                     (sp.y >= zoneTop)  && (sp.y <= zoneBottom);
@@ -1986,7 +1994,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 1.5.9s sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 1.5.9t sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
