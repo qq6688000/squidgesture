@@ -1692,7 +1692,9 @@ static CGRect SGScanForGrabber(UIView *v, NSInteger depth) {
         BOOL shapeOK = (r.size.width >= 60 && r.size.width <= ss.width * 0.9 &&
                         r.size.height >= 1 && r.size.height <= 30);
         BOOL placeOK = (r.origin.y >= ss.height * 0.85);
-        if (shapeOK && placeOK) return r;
+        BOOL centred = (fabs((r.origin.x + r.size.width * 0.5) - ss.width * 0.5)
+                        <= ss.width * 0.12);
+        if (shapeOK && placeOK && centred) return r;
     }
     for (UIView *sub in v.subviews) {
         CGRect r = SGScanForGrabber(sub, depth + 1);
@@ -1717,6 +1719,16 @@ static CGRect SGHomeBarRect(void) {
             r.origin.x += w.frame.origin.x;
             r.origin.y += w.frame.origin.y;
             if (r.size.width >= 60) {
+                // The real home bar is centred. A view that matches the class
+                // name but sits off-centre is a different grabber (or lives in
+                // an offset window) - using it would slide the zone sideways.
+                CGSize scr = [UIScreen mainScreen].bounds.size;
+                CGFloat mid = r.origin.x + r.size.width * 0.5;
+                if (fabs(mid - scr.width * 0.5) > scr.width * 0.12) {
+                    SGLog(@"homeBar rejected off-centre %.0f,%.0f %.0fx%.0f",
+                          r.origin.x, r.origin.y, r.size.width, r.size.height);
+                    continue;
+                }
                 cached = r; cachedValid = YES; cachedScreen = nowScreen;
                 SGLog(@"homeBar detected %.0f,%.0f %.0fx%.0f",
                       r.origin.x, r.origin.y, r.size.width, r.size.height);
@@ -1770,11 +1782,9 @@ static CGRect SGHomeBarRect(void) {
     if (pp && pp.hasStart) p = pp.startPoint;
     UIWindow *win = v.window;
     CGPoint sp = (win ? [win convertPoint:p toWindow:nil] : p);
-    CGSize screen = [UIScreen mainScreen].bounds.size;
-    // Anchored to the black home bar itself: the swipe must START on the bar (or
-    // within PanelSwipeAboveBar points just above it) and in its right half,
-    // running out to the screen edge. Nothing is measured from the screen edge,
-    // so the zone lines up with the bar the user actually sees on any device.
+    // Anchored to the black home indicator itself: every edge of the zone below
+    // comes from the bar's own frame. No edge is taken from the screen, so the
+    // zone lines up with the bar the user actually sees on any device.
     CGFloat tolerance = MIN(MAX(gPanelBarTolerance, 0.0), 60.0);
     CGFloat pad       = MIN(MAX(gPanelBarPad, 10.0), 80.0);
 
@@ -1790,7 +1800,9 @@ static CGRect SGHomeBarRect(void) {
     CGFloat zoneLeft   = MAX(barL, CGRectGetMidX(bar) - pad * 0.5);
     CGFloat zoneRight  = barR + pad * 0.5;
     CGFloat zoneTop    = barT - tolerance;
-    CGFloat zoneBottom = screen.height;
+    // Bottom edge is the BAR's bottom, not the screen's: the ~20pt of empty
+    // space below the bar is not part of the black bar and must not count.
+    CGFloat zoneBottom = CGRectGetMaxY(bar) + 6.0;
 
     BOOL inCorner = (sp.x >= zoneLeft) && (sp.x <= zoneRight) &&
                     (sp.y >= zoneTop)  && (sp.y <= zoneBottom);
