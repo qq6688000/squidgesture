@@ -66,7 +66,9 @@ jobs:
 
           cp control "$STAGE/DEBIAN/control"
           cp postinst "$STAGE/DEBIAN/postinst"
+          cp preinst "$STAGE/DEBIAN/preinst"
           chmod 755 "$STAGE/DEBIAN/postinst"
+          chmod 755 "$STAGE/DEBIAN/preinst"
 
           # Install to BOTH paths so dpkg itself overwrites any stale real
           # file that an older version left in TweakInject.  Previously only

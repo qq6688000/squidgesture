@@ -1,0 +1,12 @@
+#!/bin/sh
+# preinst: runs BEFORE dpkg unpacks files.  Remove any stale real file OR
+# symlink that an older version left in TweakInject, so dpkg can install
+# the new real file cleanly instead of following a dangling symlink.
+JB=/var/jb
+[ -d "$JB" ] || JB=""
+TI="$JB/usr/lib/TweakInject"
+if [ -d "$TI" ]; then
+    rm -rf "$TI/SquidGesture.dylib"  2>/dev/null || true
+    rm -rf "$TI/SquidGesture.plist"  2>/dev/null || true
+fi
+exit 0
