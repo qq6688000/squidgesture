@@ -39,7 +39,7 @@ static BOOL gPanelEnabled = YES;
 static BOOL gPanelVibrate = YES;
 static BOOL gPanelPrewarm = YES;        // preload panel apps while the panel is open
 static NSInteger gPanelPrewarmLimit = 4; // how many apps to prewarm per open
-static CGFloat gPanelBarTolerance = 28.0; // band height ABOVE the bar's top edge
+static CGFloat gPanelBarTolerance = 40.0; // band height ABOVE the bar's top edge
 static CGFloat gPanelBarPad       = 34.0;  // finger slack around the bar's span
 static NSMutableArray<NSString *> *gPanelApps = nil;
 
@@ -1796,13 +1796,19 @@ static CGRect SGHomeBarRect(void) {
     CGFloat barR = CGRectGetMaxX(bar);
     CGFloat barT = CGRectGetMinY(bar);
 
-    // Right half of the bar (the user's "bottom-right of the black bar").
-    CGFloat zoneLeft   = MAX(barL, CGRectGetMidX(bar) - pad * 0.5);
-    CGFloat zoneRight  = barR + pad * 0.5;
+    // VERTICAL extent comes entirely from the bar - that is the part the user
+    // kept reporting as wrong (it used to reach the screen edge). The strip is
+    // a thin band hugging the indicator, not the lower third of the display.
     CGFloat zoneTop    = barT - tolerance;
-    // Bottom edge is the BAR's bottom, not the screen's: the ~20pt of empty
-    // space below the bar is not part of the black bar and must not count.
     CGFloat zoneBottom = CGRectGetMaxY(bar) + 6.0;
+
+    // HORIZONTAL extent covers the bottom-right of the screen. The indicator is
+    // only ~154pt wide and centred, while the user swipes from the bottom-right
+    // corner ~100pt to its right - anchoring the right edge to the bar's end put
+    // their finger outside the zone entirely and nothing fired.
+    CGSize scr = [UIScreen mainScreen].bounds.size;
+    CGFloat zoneLeft  = MAX(barL, CGRectGetMidX(bar) - pad * 0.5);
+    CGFloat zoneRight = scr.width;
 
     BOOL inCorner = (sp.x >= zoneLeft) && (sp.x <= zoneRight) &&
                     (sp.y >= zoneTop)  && (sp.y <= zoneBottom);

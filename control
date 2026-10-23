@@ -1,6 +1,6 @@
 Package: com.minis.squidgesture
 Name: SquidGesture
-Version: 1.6.2
+Version: 1.6.3
 Architecture: iphoneos-arm64
 Description: System-wide gestures plus a pull-up app launcher panel. Swipe up from the bottom-right corner to open a panel of your own apps (add/remove freely). Edge swipes, corner taps and multi-finger gestures also included.
 Maintainer: Minis

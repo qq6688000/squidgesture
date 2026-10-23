@@ -37,7 +37,7 @@ if [ ! -f "$PREFS" ]; then
     <key>PanelVibrate</key><true/>
     <key>PanelPrewarm</key><true/>
     <key>PanelPrewarmLimit</key><integer>4</integer>
-    <key>PanelBarTolerance</key><real>28</real>
+    <key>PanelBarTolerance</key><real>40</real>
     <key>PanelBarPad</key><real>34</real>
     <key>PanelApps</key>
     <array>
@@ -56,7 +56,7 @@ fi
 
 killall -9 SpringBoard 2>/dev/null || true
 
-echo "SquidGesture 1.6.2 installed."
+echo "SquidGesture 1.6.3 installed."
 echo ""
 echo "  Swipe up from the BOTTOM-RIGHT corner -> app panel (+ to add apps)"
 echo "  Left edge swipe    -> Back        Right edge swipe -> App switcher"
