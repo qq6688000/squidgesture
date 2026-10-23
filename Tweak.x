@@ -11,6 +11,7 @@
 //     makeKeyAndVisible/becomeKeyWindow.
 
 #import <UIKit/UIKit.h>
+#import <unistd.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
@@ -1813,6 +1814,9 @@ static void attachAllWindows(void) {
         return;
     }
     loadPrefs();
+    SGLog(@"=== 1.6.7 ctor sb=%d pid=%d arch=%s ===", (int)isSpringBoard(),
+          (int)getpid(),
+          sizeof(void*)==8 ? "64" : "32");
     initSBS();
 
     CFNotificationCenterAddObserver(
