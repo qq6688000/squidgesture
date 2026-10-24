@@ -1921,11 +1921,23 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         }
     }
 
-    // 2.3.0: a double tap ANYWHERE opens the power menu (lock / screenshot /
-    // log out / restart / shut down).  Per the user's request the whole screen
-    // is the trigger, so no zone maths is needed any more.
-    SGLog(@"doubleTap %.0f,%.0f -> power menu", p.x, p.y);
-    if (gCornerTapPower) doPowerMenu();
+    // 2.8.0: the trigger is only the status-bar band, level with the Dynamic
+    // Island - not the whole screen.  Height comes from the safe-area top
+    // inset (falls back to a sane default when the window reports 0).
+    CGFloat bandH = 60.0;
+    @try {
+        UIWindow *keyWin = win ?: [UIApplication sharedApplication].keyWindow;
+        if (keyWin) {
+            UIEdgeInsets safe = keyWin.safeAreaInsets;
+            if (safe.top > 20.0) bandH = safe.top + 10.0;
+        }
+    } @catch (__unused NSException *e) { }
+
+    BOOL inBand = (p.y >= 0 && p.y <= bandH);
+    SGLog(@"doubleTap %.0f,%.0f band[0..%.0f] -> %d",
+          p.x, p.y, bandH, inBand);
+
+    if (inBand && gCornerTapPower) doPowerMenu();
 }
 
 - (void)onTwoFingerDown:(UISwipeGestureRecognizer *)g {
@@ -1998,7 +2010,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.7.0 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.8.0 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
