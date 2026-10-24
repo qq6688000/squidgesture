@@ -1300,6 +1300,58 @@ static void sbHome(void) {
     }
 }
 
+// 2.9.3: locking the device and turning the display off are separate things.
+// Every lock path below returns as soon as it succeeds, so the backlight was
+// never touched and the screen stayed lit. This runs unconditionally after
+// whichever path wins.
+static void sbSleepDisplay(void) {
+    mach_port_t p = gGetPort ? gGetPort() : 0;
+    SGLog(@"sbSleepDisplay: port=%u dim=%p", p, gDimScreen);
+    if (p && gDimScreen) {
+        gDimScreen(p, 1);
+        SGLog(@"sbSleepDisplay: SBDimScreen OK");
+        return;
+    }
+
+    // Next: ask SpringBoard's own sleep service - this is what "screen off"
+    // does internally and it works even when SBDimScreen is not exported.
+    Class sleepMgr = objc_getClass("SBScreenSleepCoordinator");
+    if (!sleepMgr) sleepMgr = objc_getClass("SBScreenWakeAnimationController");
+    if (sleepMgr) {
+        id inst = nil;
+        SEL sh = NSSelectorFromString(@"sharedInstance");
+        if ([sleepMgr respondsToSelector:sh])
+            inst = ((id(*)(id, SEL))objc_msgSend)(sleepMgr, sh);
+        for (NSString *n in @[ @"goToSleep", @"sleepNow", @"turnOffScreen" ]) {
+            SEL sel = NSSelectorFromString(n);
+            if (inst && [inst respondsToSelector:sel]) {
+                ((void(*)(id, SEL))objc_msgSend)(inst, sel);
+                SGLog(@"sbSleepDisplay: %@ -%@ OK", NSStringFromClass(sleepMgr), n);
+                return;
+            }
+        }
+    }
+
+    // Last resort: tell the backboard to dim.
+    Class bb = objc_getClass("BKSDisplayBrightnessManager");
+    if (!bb) bb = objc_getClass("SBDisplayBrightnessController");
+    if (bb) {
+        SEL sh = NSSelectorFromString(@"sharedInstance");
+        if ([bb respondsToSelector:sh]) {
+            id inst = ((id(*)(id, SEL))objc_msgSend)(bb, sh);
+            for (NSString *n in @[ @"setBrightness:", @"setDisplayBrightness:" ]) {
+                SEL sel = NSSelectorFromString(n);
+                if (inst && [inst respondsToSelector:sel]) {
+                    ((void(*)(id, SEL, float))objc_msgSend)(inst, sel, 0.0f);
+                    SGLog(@"sbSleepDisplay: %@ -%@ 0", NSStringFromClass(bb), n);
+                    return;
+                }
+            }
+        }
+    }
+    SGLog(@"sbSleepDisplay: no path available");
+}
+
 static void sbLock(void) {
     SGLog(@"sbLock enter");
 
@@ -1327,6 +1379,7 @@ static void sbLock(void) {
                         ((id(*)(id, SEL))objc_msgSend)(inst, sel);
                     }
                     SGLog(@"sbLock: SBLockScreenManager %@ OK", sels[i]);
+                    sbSleepDisplay();
                     return;
                 } @catch (NSException *e) {
                     SGLog(@"sbLock: %@ threw %@", sels[i], e.reason);
@@ -1343,6 +1396,7 @@ static void sbLock(void) {
         gLockDevice(p, 1);
         if (gDimScreen) gDimScreen(p, 1);
         SGLog(@"sbLock: SBLockDevice OK");
+        sbSleepDisplay();
         return;
     }
 
@@ -1362,6 +1416,7 @@ static void sbLock(void) {
             if (inst && [inst respondsToSelector:sel]) {
                 ((void(*)(id, SEL))objc_msgSend)(inst, sel);
                 SGLog(@"sbLock: %@ -%@ OK", NSStringFromClass(hb), n);
+                sbSleepDisplay();
                 return;
             }
         }
@@ -1379,12 +1434,14 @@ static void sbLock(void) {
             if (inst && [inst respondsToSelector:act]) {
                 ((void(*)(id, SEL))objc_msgSend)(inst, act);
                 SGLog(@"sbLock: SBLockScreenViewController -activate OK");
+                sbSleepDisplay();
                 return;
             }
         }
     }
 
     SGLog(@"sbLock: all paths failed");
+    sbSleepDisplay();   // at least turn the screen off
 }
 
 // 2.1.0: power menu (log out / restart) for the left half of the status bar.
@@ -2074,7 +2131,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.9.2 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.9.3 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
