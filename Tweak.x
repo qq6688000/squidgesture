@@ -1343,195 +1343,93 @@ static void sbHome(void) {
 // clamps above zero; and the BLS path was passing state 0, which is UNKNOWN,
 // not "off". BLSBacklightState is Unknown/Active/Inactive/AlwaysOn = 0/1/2/3,
 // so the correct request is 2.
+// 3.2.0 — real screen off, finally.
+//
+// What the logs proved:
+//   * BLSBacklight reports state 2 (already "inactive") both BEFORE and AFTER
+//     the request, so that state is about the backlight service's own notion,
+//     not the physical panel. Driving it changes nothing.
+//   * SBDimScreen / UIScreen.brightness / BLS requests: all report success and
+//     all leave the panel lit.
+//   * SBLockScreenManager / SBUIController / SBLockHardwareButton: none of
+//     those class names exist on 17.3.1 at all.
+//
+// So: enumerate the classes that actually exist and find the real power-key
+// owner, then simulate that key. Enumerated once, logged, then driven.
+static NSArray *SGSleepButtonClasses(void) {
+    static NSArray *cached = nil;
+    if (cached) return cached;
+
+    NSMutableArray *out = [NSMutableArray array];
+    unsigned int count = 0;
+    Class *all = objc_copyClassList(&count);
+    NSMutableString *seen = [NSMutableString string];
+    for (unsigned int i = 0; i < count; i++) {
+        const char *nm = class_getName(all[i]);
+        if (!nm) continue;
+        BOOL hit = strcasestr(nm, "HardwareButton") ||
+                   strcasestr(nm, "PowerButton") ||
+                   strcasestr(nm, "LockButton") ||
+                   strcasestr(nm, "SleepWake");
+        if (!hit) continue;
+        [out addObject:@(nm)];
+        if (seen.length < 1200) [seen appendFormat:@" %s", nm];
+    }
+    if (all) free(all);
+    SGLog(@"sbSleepDisplay: button classes =%@", seen);
+    cached = out;
+    return cached;
+}
+
 static void sbSleepDisplay(void) {
     SGLog(@"sbSleepDisplay enter");
 
-    void *h = dlopen("/System/Library/PrivateFrameworks/"
-                     "BacklightServices.framework/BacklightServices", RTLD_NOW);
-    SGLog(@"sbSleepDisplay: BacklightServices=%p", h);
+    NSArray *classes = SGSleepButtonClasses();
+    NSArray *sels = @[ @"performSleepWakeButtonDown",
+                       @"performLockButtonDown",
+                       @"performPowerButtonDown",
+                       @"sleepWakeButtonDown",
+                       @"lockButtonDown",
+                       @"powerButtonDown" ];
 
-    Class blCls = NSClassFromString(@"BLSBacklight");
-    Class reqCls = NSClassFromString(@"BLSBacklightChangeRequest");
-    SGLog(@"sbSleepDisplay: BLSBacklight=%@ request=%@", blCls, reqCls);
-
-    id backend = nil;
-    if (blCls) {
-        for (NSString *n in @[ @"sharedBacklight", @"sharedInstance" ]) {
-            SEL sel = NSSelectorFromString(n);
-            if (![blCls respondsToSelector:sel]) continue;
-            backend = ((id(*)(id, SEL))objc_msgSend)(blCls, sel);
-            if (backend) { SGLog(@"sbSleepDisplay: backlight via +%@", n); break; }
-        }
-        // Always dump the real API once - the previous run proved the instance
-        // exists but neither requestBacklightChangeToState: variant does.
-        static BOOL dumped = NO;
-        if (!dumped) {
-            dumped = YES;
-            NSMutableString *str = [NSMutableString string];
-            unsigned int outCount = 0;
-            Method *ms = class_copyMethodList(blCls, &outCount);
-            for (unsigned int i = 0; i < outCount; i++)
-                [str appendFormat:@" %@", NSStringFromSelector(method_getName(ms[i]))];
-            if (ms) free(ms);
-            SGLog(@"sbSleepDisplay: BLSBacklight methods =%@", str);
-
-            if (backend) {
-                NSMutableString *is = [NSMutableString string];
-                unsigned int ic = 0;
-                Method *im = class_copyMethodList(object_getClass(backend), &ic);
-                for (unsigned int i = 0; i < ic; i++)
-                    [is appendFormat:@" %@", NSStringFromSelector(method_getName(im[i]))];
-                if (im) free(im);
-                SGLog(@"sbSleepDisplay: BLSBacklight class methods =%@", is);
-            }
-        }
-    }
-
-    // state 2 == Inactive
-    const int64_t kInactive = 2;
-
-    // 3.1.2 — built from the method dump:
-    //   BLSBacklight:            -performChangeRequest: -backlightState
-    //   BLSBacklightChangeEvent: -initWithEventID:state:previousState:changeRequest:
-    //                            -changeRequest -state -previousState
-    // Read backlightState before and after so the log proves whether it worked.
-    if (backend) {
-        @try {
-            SEL bs = NSSelectorFromString(@"backlightState");
-            int64_t before = -1;
-            if ([backend respondsToSelector:bs])
-                before = ((int64_t(*)(id, SEL))objc_msgSend)(backend, bs);
-            SGLog(@"sbSleepDisplay: backlightState before=%lld", before);
-            SEL it = NSSelectorFromString(@"isTransitioning");
-            SEL ia = NSSelectorFromString(@"isAlwaysOnEnabled");
-            BOOL transitioning = [backend respondsToSelector:it]
-                ? ((BOOL(*)(id, SEL))objc_msgSend)(backend, it) : NO;
-            BOOL alwaysOn = [backend respondsToSelector:ia]
-                ? ((BOOL(*)(id, SEL))objc_msgSend)(backend, ia) : NO;
-            SGLog(@"sbSleepDisplay: transitioning=%d alwaysOn=%d",
-                  transitioning, alwaysOn);
-
-            // 3.1.3: constructing BLSBacklightChangeEvent with a guessed
-            // parameter layout killed the process (the log stopped right after
-            // backlightState). Never build these objects blind again.
-            //
-            // performChangeRequest: only needs a request object, and the
-            // backlight can produce one itself via its observer machinery.
-            // Try the class-method factories that exist on the real build,
-            // each guarded by respondsToSelector, and log before every call so
-            // a crash still leaves a breadcrumb.
-            Class reqCls = NSClassFromString(@"BLSBacklightChangeRequest");
-            SGLog(@"sbSleepDisplay: request class=%@", reqCls);
-
-            NSArray *factories = @[
-                @"requestWithRequestedActivityState:explanation:timestamp:sourceEvent:",
-                @"requestWithState:",
-                @"requestWithRequestedState:"
-            ];
-            for (NSString *fn in factories) {
-                SEL sel = NSSelectorFromString(fn);
-                if (!reqCls || ![reqCls respondsToSelector:sel]) continue;
-                SGLog(@"sbSleepDisplay: trying factory %@", fn);
-                @try {
-                    id req = nil;
-                    if ([fn hasSuffix:@"sourceEvent:"])
-                        req = ((id(*)(id, SEL, int64_t, id, double, int64_t))
-                               objc_msgSend)(reqCls, sel, kInactive,
-                                             @"SquidGesture", 0.0, 0);
-                    else if ([fn isEqualToString:@"requestWithState:"])
-                        req = ((id(*)(id, SEL, int64_t))objc_msgSend)(reqCls, sel, kInactive);
-                    else
-                        req = ((id(*)(id, SEL, int64_t))objc_msgSend)(reqCls, sel, kInactive);
-                    SGLog(@"sbSleepDisplay: factory %@ -> %@", fn,
-                          req ? @"ok" : @"nil");
-                    if (req) {
-                        ((void(*)(id, SEL, id))objc_msgSend)(
-                            backend, NSSelectorFromString(@"performChangeRequest:"), req);
-                        SGLog(@"sbSleepDisplay: performChangeRequest done");
-                        break;
-                    }
-                } @catch (NSException *e) {
-                    SGLog(@"sbSleepDisplay: %@ threw %@", fn, e.reason);
-                }
-            }
-
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-              int64_t after = -1;
-              if ([backend respondsToSelector:bs])
-                  after = ((int64_t(*)(id, SEL))objc_msgSend)(backend, bs);
-              SGLog(@"sbSleepDisplay: backlightState after=%lld %@", after,
-                    (after == 2) ? @"OK SCREEN OFF" : @"still on");
-            });
-        } @catch (NSException *e) {
-            SGLog(@"sbSleepDisplay: request path threw %@", e.reason);
-        }
-    }
-
-    // 3.1.1: BLSBacklight may not expose a public request method on 17.3.1.
-    // BLSBacklightChangeEvent carries the state change; the host applies it.
-    // Try the change-event class as well, and the SpringBoard-side executor.
-    @try {
-        Class evCls = NSClassFromString(@"BLSBacklightChangeEvent");
-        SGLog(@"sbSleepDisplay: BLSBacklightChangeEvent=%@", evCls);
-        if (evCls && backend) {
-            NSMutableString *es = [NSMutableString string];
-            unsigned int ec = 0;
-            Method *em = class_copyMethodList(evCls, &ec);
-            for (unsigned int i = 0; i < ec; i++)
-                [es appendFormat:@" %@", NSStringFromSelector(method_getName(em[i]))];
-            if (em) free(em);
-            SGLog(@"sbSleepDisplay: changeEvent methods =%@", es);
-        }
-
-        // The host side of BacklightServices owns the actual transition.
-        for (NSString *cn in @[ @"BLSBacklightSceneEnvironmentUpdater",
-                                @"BLSHBacklightService" ]) {
-            Class c = NSClassFromString(cn);
-            if (!c) continue;
-            id inst = nil;
-            SEL sh = NSSelectorFromString(@"sharedInstance");
-            if ([c respondsToSelector:sh])
-                inst = ((id(*)(id, SEL))objc_msgSend)(c, sh);
-            for (NSString *sn in @[ @"transitionToState:", @"setBacklightState:" ]) {
-                SEL sel = NSSelectorFromString(sn);
-                if (inst && [inst respondsToSelector:sel]) {
-                    ((void(*)(id, SEL, int64_t))objc_msgSend)(inst, sel, kInactive);
-                    SGLog(@"sbSleepDisplay: %@ -%@ 2", cn, sn);
-                    break;
-                }
-            }
-        }
-    } @catch (NSException *e) {
-        SGLog(@"sbSleepDisplay: extra BLS paths threw %@", e.reason);
-    }
-
-    // Side-button interaction: this is the one call that both locks and sleeps.
-    for (NSString *cn in @[ @"SBSleepWakeHardwareButtonInteraction",
-                            @"SBLockHardwareButton" ]) {
-        Class c = objc_getClass(cn.UTF8String);
+    for (NSString *cn in classes) {
+        Class c = NSClassFromString(cn);
         if (!c) continue;
-        id inst = nil;
+
+        // instance (sharedInstance or new) plus the class itself as fallback
+        NSMutableArray *targets = [NSMutableArray array];
         for (NSString *maker in @[ @"sharedInstance", @"new" ]) {
             SEL m = NSSelectorFromString(maker);
             if (![c respondsToSelector:m]) continue;
             id r = ((id(*)(id, SEL))objc_msgSend)(c, m);
             if ([maker isEqualToString:@"new"] && r)
                 r = ((id(*)(id, SEL))objc_msgSend)(r, NSSelectorFromString(@"init"));
-            if (r) { inst = r; break; }
+            if (r) [targets addObject:r];
         }
-        if (!inst) continue;
-        for (NSString *sn in @[ @"performSleepWakeButtonDown",
-                                @"performSleepButtonDown" ]) {
-            SEL sel = NSSelectorFromString(sn);
-            if (![inst respondsToSelector:sel]) continue;
-            ((void(*)(id, SEL))objc_msgSend)(inst, sel);
-            SGLog(@"sbSleepDisplay: %@ -%@", cn, sn);
-            break;
+        [targets addObject:c];
+
+        for (id t in targets) {
+            for (NSString *sn in sels) {
+                SEL sel = NSSelectorFromString(sn);
+                BOOL has = [t respondsToSelector:sel];
+                if (!has && t != c) has = [t respondsToSelector:sel];
+                if (!has) continue;
+                SGLog(@"sbSleepDisplay: calling %@ -%@", cn, sn);
+                @try {
+                    if (t == c)
+                        ((void(*)(id, SEL))objc_msgSend)(c, sel);
+                    else
+                        ((void(*)(id, SEL))objc_msgSend)(t, sel);
+                    SGLog(@"sbSleepDisplay: %@ -%@ returned", cn, sn);
+                    return;
+                } @catch (NSException *e) {
+                    SGLog(@"sbSleepDisplay: %@ -%@ threw %@", cn, sn, e.reason);
+                }
+            }
         }
     }
 
-    SGLog(@"sbSleepDisplay done");
+    SGLog(@"sbSleepDisplay: no button class matched");
 }
 
 static void sbLock(void) {
@@ -2313,7 +2211,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.1.3 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.2.0 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
