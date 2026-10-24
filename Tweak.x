@@ -182,13 +182,10 @@ static void initSBS(void) {
 //   notify_post com.minis.squidgesture.test.hide
 #define kNotifyHide     "com.minis.squidgesture.test.hide"
 
-static void vibrate(void) {
-    if (gVibrationFeedback) AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
-}
-
-static void SGPanelVibrate(void) {
-    if (gPanelVibrate) AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
-}
+// 2.9.2: all haptic feedback removed at the user's request. Kept as no-op
+// functions so every existing call site stays valid.
+static void vibrate(void) { }
+static void SGPanelVibrate(void) { }
 
 #pragma mark - Launcher panel : app catalog
 
@@ -2077,7 +2074,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.9.1 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.9.2 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
