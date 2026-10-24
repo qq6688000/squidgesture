@@ -1344,95 +1344,37 @@ static void sbHome(void) {
 // not "off". BLSBacklightState is Unknown/Active/Inactive/AlwaysOn = 0/1/2/3,
 // so the correct request is 2.
 
-// 3.3.0 — the physical power key, injected as a HID event.
+// 3.3.1 — go back to what actually worked, minus what broke it.
 //
-// Everything at the SpringBoard object level failed on 17.3.1:
-//   lockDeviceAnimated:  no implementer in-process
-//   SBLockHardwareButton gesture manager only
-//   SBLockDevice         privilege-blocked (caused the respring)
-//   lockbutton notify    ignored
+// The "锁屏就注销" (lock causes respring) was NOT caused by SBLockDevice.
+// SBLockDevice(port, 1) is exactly what Apple's MDM framework calls, and the
+// log showed it returning cleanly ("sbLock: SBLockDevice OK").
 //
-// The hardware path is the one thing that cannot be bypassed: the side button
-// arrives as a consumer-page HID usage 0x30. Sending that through the HID
-// system makes SpringBoard treat it as a real press, so lock AND screen-off
-// happen exactly as if the user pressed it.
+// The respring was caused by sbSleepDisplay(), which ran AFTER SBLockDevice
+// and tried to construct BLSBacklightChangeEvent with a guessed parameter
+// layout — that crashed SpringBoard.
+//
+// SBLockDevice already handles BOTH locking AND screen-off (that is what
+// locking does), so no separate sleep call is needed. Just call it and stop.
 static void sbLock(void) {
-    SGLog(@"sbLock enter (HID power key)");
+    SGLog(@"sbLock enter");
 
-    void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",
-                         RTLD_NOW);
-    if (!iokit) {
-        SGLog(@"sbLock: no IOKit");
-        return;
-    }
+    mach_port_t p = gGetPort ? gGetPort() : 0;
+    SGLog(@"sbLock: port=%u lockDevice=%p", p, gLockDevice);
 
-    Class clientCls = NSClassFromString(@"IOHIDEventSystemClient");
-    Class evCls     = NSClassFromString(@"IOHIDEvent");
-    SGLog(@"sbLock: client=%@ event=%@", clientCls, evCls);
-
-    id client = nil;
-    if (clientCls) {
-        for (NSString *n in @[ @"sharedInstance", @"create" ]) {
-            SEL sel = NSSelectorFromString(n);
-            if (![clientCls respondsToSelector:sel]) continue;
-            client = ((id(*)(id, SEL))objc_msgSend)(clientCls, sel);
-            if (client) { SGLog(@"sbLock: client via +%@", n); break; }
+    if (p && gLockDevice) {
+        @try {
+            gLockDevice(p, 1);
+            SGLog(@"sbLock: SBLockDevice(port, 1) done");
+            // Do NOT call sbSleepDisplay or any BLS code here.
+            // The system turns the screen off as part of locking.
+            return;
+        } @catch (NSException *e) {
+            SGLog(@"sbLock: SBLockDevice threw %@", e.reason);
         }
     }
-    if (!client) {
-        SGLog(@"sbLock: no HID client - giving up rather than respringing");
-        return;
-    }
 
-    // Dump the event factories once so this is never a guess again.
-    static BOOL dumped = NO;
-    if (!dumped && evCls) {
-        dumped = YES;
-        NSMutableString *str = [NSMutableString string];
-        unsigned int mc = 0;
-        Method *ms = class_copyMethodList(object_getClass(evCls), &mc);
-        for (unsigned int i = 0; i < mc; i++) {
-            NSString *sn = NSStringFromSelector(method_getName(ms[i]));
-            if ([sn hasPrefix:@"keyboard"] || [sn hasPrefix:@"vendor"] ||
-                [sn hasPrefix:@"event"] || [sn hasPrefix:@"digitizer"])
-                [str appendFormat:@" %@", sn];
-        }
-        if (ms) free(ms);
-        SGLog(@"sbLock: IOHIDEvent factories =%@", str);
-    }
-
-    SEL mk      = NSSelectorFromString(@"keyboardEvent:");
-    SEL dispatch = NSSelectorFromString(@"dispatchEvent:toDispatcher:");
-    BOOL canMake = evCls && [evCls respondsToSelector:mk];
-    BOOL canSend = [client respondsToSelector:dispatch];
-    SGLog(@"sbLock: canMake=%d canSend=%d", canMake, canSend);
-
-    if (canMake && canSend) {
-        // usage 0x30 on the keyboard/consumer page is the power/side button.
-        __block int sent = 0;
-        void (^press)(BOOL) = ^(BOOL down) {
-            @try {
-                id ev = ((id(*)(id, SEL, uint32_t))objc_msgSend)(evCls, mk, 0x30);
-                if (!ev) return;
-                SEL setV = NSSelectorFromString(@"setIntegerValue:");
-                if ([ev respondsToSelector:setV])
-                    ((void(*)(id, SEL, int64_t))objc_msgSend)(ev, setV, down ? 1 : 0);
-                ((void(*)(id, SEL, id, id))objc_msgSend)(client, dispatch, ev, nil);
-                sent++;
-            } @catch (NSException *e) {
-                SGLog(@"sbLock: press threw %@", e.reason);
-            }
-        };
-        press(YES);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-          press(NO);
-          SGLog(@"sbLock: power key sent (%d events)", sent);
-        });
-        return;
-    }
-
-    SGLog(@"sbLock: HID path unusable - doing nothing");
+    SGLog(@"sbLock: SBLockDevice unavailable, nothing else tried");
 }
 
 // 2.1.0: power menu (log out / restart) for the left half of the status bar.
@@ -2122,7 +2064,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.3.0 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.3.1 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
