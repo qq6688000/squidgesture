@@ -1305,81 +1305,110 @@ static void sbHome(void) {
 // never touched and the screen stayed lit. This runs unconditionally after
 // whichever path wins.
 static void sbSleepDisplay(void) {
-    // 2.9.4: the log showed "SBDimScreen OK" while the screen stayed LIT, so
-    // that symbol merely returns success on iOS 17 - it does nothing. Every
-    // path below is now tried in order of how much it actually accomplishes,
-    // and no path returns early except the ones that really sleep the device.
+    // 2.9.5: every class name tried so far was a guess, and on 17.3.1 NONE of
+    // them existed (the log showed no line for steps 1/2/4 at all). So: first
+    // report what actually exists, then drive it.
     SGLog(@"sbSleepDisplay enter");
 
-    // 1) Hardware button simulation - this is exactly what the side button
-    //    sends, and it locks + sleeps in one go.
-    Class hb = objc_getClass("SBLockHardwareButton");
-    if (hb) {
-        id inst = nil;
-        SEL sh = NSSelectorFromString(@"sharedInstance");
-        if ([hb respondsToSelector:sh])
-            inst = ((id(*)(id, SEL))objc_msgSend)(hb, sh);
-        for (NSString *n in @[ @"performSleepButtonDown",
-                               @"performLockButtonDown",
-                               @"sleepButtonDown" ]) {
-            SEL sel = NSSelectorFromString(n);
-            if (inst && [inst respondsToSelector:sel]) {
-                ((void(*)(id, SEL))objc_msgSend)(inst, sel);
-                SGLog(@"sbSleepDisplay: %@ -%@", NSStringFromClass(hb), n);
-                break;
+    // ---- diagnostics: list the real class names once ----
+    static BOOL dumped = NO;
+    if (!dumped) {
+        dumped = YES;
+        unsigned int count = 0;
+        Class *all = objc_copyClassList(&count);
+        NSMutableString *hits = [NSMutableString string];
+        for (unsigned int i = 0; i < count; i++) {
+            const char *nm = class_getName(all[i]);
+            if (!nm) continue;
+            if (strcasestr(nm, "Backlight") || strcasestr(nm, "Sleep") ||
+                strcasestr(nm, "Wake") || strcasestr(nm, "Blank")) {
+                [hits appendFormat:@" %s", nm];
             }
+            if (hits.length > 1500) break;
+        }
+        if (all) free(all);
+        SGLog(@"sbSleepDisplay: candidates =%@", hits);
+    }
+
+    // ---- the real side-button path on iOS 14-17 ----
+    NSArray *buttonClasses = @[ @"SBSleepWakeHardwareButtonInteraction",
+                                @"SBLockHardwareButton",
+                                @"SBHardwareButtonCoordinator" ];
+    NSArray *buttonSels = @[ @"performSleepWakeButtonDown",
+                             @"performSleepButtonDown",
+                             @"sleepWakeButtonDown",
+                             @"performLockButtonDown" ];
+
+    for (NSString *cn in buttonClasses) {
+        Class c = objc_getClass(cn.UTF8String);
+        if (!c) continue;
+        id inst = nil;
+        for (NSString *maker in @[ @"sharedInstance", @"new" ]) {
+            SEL m = NSSelectorFromString(maker);
+            if (![c respondsToSelector:m]) continue;
+            id r = ((id(*)(id, SEL))objc_msgSend)(c, m);
+            if ([maker isEqualToString:@"new"] && r)
+                r = ((id(*)(id, SEL))objc_msgSend)(r, NSSelectorFromString(@"init"));
+            if (r) { inst = r; break; }
+        }
+        if (!inst) { SGLog(@"sbSleepDisplay: %@ exists but no instance", cn); continue; }
+        for (NSString *sn in buttonSels) {
+            SEL sel = NSSelectorFromString(sn);
+            if (![inst respondsToSelector:sel]) continue;
+            ((void(*)(id, SEL))objc_msgSend)(inst, sel);
+            SGLog(@"sbSleepDisplay: %@ -%@", cn, sn);
+            break;
         }
     }
 
-    // 2) SpringBoard's screen sleep service.
-    for (NSString *cn in @[ @"SBScreenSleepCoordinator",
-                            @"SBCoverSheetScreenWakeController",
-                            @"SBBacklightController" ]) {
+    // ---- backlight, whatever it is called now ----
+    NSArray *blClasses = @[ @"SBBacklightController",
+                            @"SBDisplayBrightnessController",
+                            @"BKSDisplayBrightnessManager" ];
+    NSArray *blSels = @[ @"setBacklightFactor:source:",
+                         @"_setBacklightFactor:source:",
+                         @"setDisplayBrightness:",
+                         @"setBrightness:" ];
+    for (NSString *cn in blClasses) {
         Class c = objc_getClass(cn.UTF8String);
         if (!c) continue;
         id inst = nil;
         SEL sh = NSSelectorFromString(@"sharedInstance");
         if ([c respondsToSelector:sh])
             inst = ((id(*)(id, SEL))objc_msgSend)(c, sh);
-        for (NSString *n in @[ @"goToSleep", @"sleepNow", @"turnOffScreen",
-                               @"setBacklightFactor:source:", @"_setBacklightFactor:source:" ]) {
-            SEL sel = NSSelectorFromString(n);
-            if (!inst || ![inst respondsToSelector:sel]) continue;
+        if (!inst) continue;
+        for (NSString *sn in blSels) {
+            SEL sel = NSSelectorFromString(sn);
+            if (![inst respondsToSelector:sel]) continue;
             @try {
-                if ([n hasSuffix:@":"]) {
-                    ((void(*)(id, SEL, float))objc_msgSend)(inst, sel, 0.0f);
-                } else if ([n hasSuffix:@"source:"]) {
+                if ([sn hasSuffix:@"source:"])
                     ((void(*)(id, SEL, float, int64_t))objc_msgSend)(inst, sel, 0.0f, 1);
-                } else {
-                    ((void(*)(id, SEL))objc_msgSend)(inst, sel);
-                }
-                SGLog(@"sbSleepDisplay: %@ -%@", cn, n);
-            } @catch (__unused NSException *e) { }
+                else
+                    ((void(*)(id, SEL, float))objc_msgSend)(inst, sel, 0.0f);
+                SGLog(@"sbSleepDisplay: %@ -%@ 0", cn, sn);
+            } @catch (NSException *e) {
+                SGLog(@"sbSleepDisplay: %@ -%@ threw %@", cn, sn, e.reason);
+            }
+            break;
         }
     }
 
-    // 3) SBDimScreen - keeps reporting success on 17 but is harmless.
+    // ---- guaranteed: zero the screen brightness ----
+    // -[UIScreen brightness] is public API. Setting it to 0 blacks the panel
+    // immediately, which is what "熄屏" looks like even when the private
+    // backlight services are unavailable. It restores on any interaction.
+    @try {
+        [UIScreen mainScreen].brightness = 0.0;
+        SGLog(@"sbSleepDisplay: UIScreen.brightness = 0");
+    } @catch (NSException *e) {
+        SGLog(@"sbSleepDisplay: brightness threw %@", e.reason);
+    }
+
+    // ---- last: SBDimScreen, harmless on 17 ----
     mach_port_t p = gGetPort ? gGetPort() : 0;
     if (p && gDimScreen) {
         gDimScreen(p, 1);
-        SGLog(@"sbSleepDisplay: SBDimScreen called (may be a no-op on 17)");
-    }
-
-    // 4) Brightness to zero as a visible fallback.
-    Class bb = objc_getClass("BKSDisplayBrightnessManager");
-    if (!bb) bb = objc_getClass("SBDisplayBrightnessController");
-    if (bb) {
-        SEL sh = NSSelectorFromString(@"sharedInstance");
-        id inst = [bb respondsToSelector:sh]
-                    ? ((id(*)(id, SEL))objc_msgSend)(bb, sh) : nil;
-        for (NSString *n in @[ @"setBrightness:", @"setDisplayBrightness:" ]) {
-            SEL sel = NSSelectorFromString(n);
-            if (inst && [inst respondsToSelector:sel]) {
-                ((void(*)(id, SEL, float))objc_msgSend)(inst, sel, 0.0f);
-                SGLog(@"sbSleepDisplay: %@ -%@ 0", NSStringFromClass(bb), n);
-                break;
-            }
-        }
+        SGLog(@"sbSleepDisplay: SBDimScreen called");
     }
     SGLog(@"sbSleepDisplay done");
 }
@@ -2163,7 +2192,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.9.4 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.9.5 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
