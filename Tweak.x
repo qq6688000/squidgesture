@@ -1622,14 +1622,12 @@ static void doScreenshot(void) {
     vibrate();
     SGLog(@"doScreenshot enter isSpringBoard=%d", isSpringBoard());
 
-    // 2.4.3
-    // - CARenderServerRenderDisplay is NOT safe: its arity differs between iOS
-    //   versions, so a 4-arg call into a 5-arg build smashes the stack and drops
-    //   SpringBoard into safe mode. Never call it again.
-    // - Every SpringBoard private screenshot class is gone on iOS 17.
-    // So: drive the hardware button combination through the HID system, which
-    // is the same path the physical buttons use and produces a genuine system
-    // screenshot (flash + saved to Photos).
+    // 2.5.0
+    // - CARenderServerRenderDisplay: arity differs per iOS, 4-arg call onto a
+    //   5-arg build corrupts the stack -> safe mode. Never again.
+    // - IOHIDEventSystemClient: the class is only registered once IOKit is
+    //   loaded, so objc_getClass returned nil ("IOKit classes missing").
+    //   Load the framework first, then use the plain C entry points.
     if (!isSpringBoard()) {
         notify_post(kNotifyShot);
         return;
@@ -1637,73 +1635,95 @@ static void doScreenshot(void) {
 
     dispatch_async(dispatch_get_main_queue(), ^{
       @try {
-      Class cliCls = objc_getClass("IOHIDEventSystemClient");
-      Class evCls  = objc_getClass("IOHIDEvent");
+        void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",
+                             RTLD_NOW);
+        if (!iokit) iokit = dlopen("/usr/lib/libIOKit.dylib", RTLD_NOW);
+        if (!iokit) {
+            SGLog(@"doScreenshot: IOKit dlopen failed (%s)", dlerror());
+            return;
+        }
 
-      if (!cliCls || !evCls) {
-          SGLog(@"doScreenshot: IOKit classes missing");
-          return;
-      }
+        // The public C API: create a client, build an event, dispatch it.
+        typedef void *(*CreateFn)(CFAllocatorRef);
+        typedef void *(*EventCreateFn)(CFAllocatorRef, uint32_t, uint32_t, uint32_t, int64_t);
+        typedef void (*DispatchFn)(uint32_t, void *);
 
-      id client = nil;
-      SEL sh = NSSelectorFromString(@"sharedInstance");
-      if ([cliCls respondsToSelector:sh])
-          client = ((id(*)(id, SEL))objc_msgSend)(cliCls, sh);
-      if (!client) {
-          SEL cr = NSSelectorFromString(@"create");
-          if ([cliCls respondsToSelector:cr])
-              client = ((id(*)(id, SEL))objc_msgSend)(cliCls, cr);
-      }
-      if (!client) { SGLog(@"doScreenshot: no HID client"); return; }
-      SGLog(@"doScreenshot: HID client %@", NSStringFromClass([client class]));
+        CreateFn create = (CreateFn)dlsym(iokit, "IOHIDEventSystemClientCreate");
+        EventCreateFn evCreate =
+            (EventCreateFn)dlsym(iokit, "IOHIDEventCreateKeyboardEvent");
+        DispatchFn dispatch =
+            (DispatchFn)dlsym(iokit, "IOHIDEventSystemClientDispatchEvent");
 
-      // Build a keyboard/virtual-key event pair. 0x0C = Consumer page:
-      //   0xE9 volume up, 0x30 power. Pressing both together is the
-      //   screenshot shortcut.
-      SEL mk = NSSelectorFromString(@"keyboardEvent:");
-      if (![evCls respondsToSelector:mk]) {
-          SGLog(@"doScreenshot: IOHIDEvent +keyboardEvent: missing");
-          return;
-      }
-      SEL disp = NSSelectorFromString(@"dispatchEvent:toDispatcher:");
-      if (![client respondsToSelector:disp]) {
-          SGLog(@"doScreenshot: dispatch selector missing");
-          return;
-      }
+        SGLog(@"doScreenshot: create=%p evCreate=%p dispatch=%p",
+              create, evCreate, dispatch);
 
-      __block int sent = 0;
-      void (^send)(int32_t, BOOL) = ^(int32_t usage, BOOL down) {
-          @try {
-              id ev = ((id(*)(id, SEL, int32_t))objc_msgSend)(evCls, mk, usage);
-              if (!ev) {
-                  SGLog(@"doScreenshot: event nil for usage 0x%x", usage);
-                  return;
-              }
-              // 0 = keyboard usage page; mark press/release through the
-              // integerValue so the HID stack reports a real key event.
-              SEL setV = NSSelectorFromString(@"setIntegerValue:");
-              if ([ev respondsToSelector:setV])
-                  ((void(*)(id, SEL, int64_t))objc_msgSend)(ev, setV, down ? 1 : 0);
-              ((void(*)(id, SEL, id, id))objc_msgSend)(client, disp, ev, nil);
-              sent++;
-          } @catch (NSException *e) {
-              SGLog(@"doScreenshot: send threw %@", e.reason);
-          }
-      };
+        // Fall back to the Objective-C client if any C symbol is missing:
+        // the class only exists once IOKit is loaded, which is now the case.
+        if (!create || !evCreate || !dispatch) {
+            SGLog(@"doScreenshot: C API incomplete, trying ObjC client");
+            Class cliCls = NSClassFromString(@"IOHIDEventSystemClient");
+            Class evCls  = NSClassFromString(@"IOHIDEvent");
+            SGLog(@"doScreenshot: classes client=%@ event=%@", cliCls, evCls);
+            if (!cliCls || !evCls) { SGLog(@"doScreenshot: ObjC classes missing"); return; }
 
-      // side button down, volume up down, release both
-      send(0x30, YES);
-      send(0xE9, YES);
-      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
-                     dispatch_get_main_queue(), ^{
-        send(0xE9, NO);
-        send(0x30, NO);
-        SGLog(@"doScreenshot: button combo dispatched (%d events)", sent);
-        if (sent == 0)
-            SGLog(@"doScreenshot: HID rejected everything - no screenshot");
-      });
+            id client = nil;
+            for (NSString *n in @[ @"sharedInstance", @"create" ]) {
+                SEL sel = NSSelectorFromString(n);
+                if ([cliCls respondsToSelector:sel]) {
+                    client = ((id(*)(id, SEL))objc_msgSend)(cliCls, sel);
+                    if (client) { SGLog(@"doScreenshot: client via %@", n); break; }
+                }
+            }
+            if (!client) { SGLog(@"doScreenshot: no client"); return; }
+
+            SEL mk = NSSelectorFromString(@"keyboardEvent:");
+            SEL dsp = NSSelectorFromString(@"dispatchEvent:toDispatcher:");
+            if (![evCls respondsToSelector:mk] || ![client respondsToSelector:dsp]) {
+                SGLog(@"doScreenshot: ObjC selectors missing");
+                return;
+            }
+            __block int n = 0;
+            void (^sendObjC)(uint32_t, BOOL) = ^(uint32_t usage, BOOL down) {
+                id ev = ((id(*)(id, SEL, uint32_t))objc_msgSend)(evCls, mk, usage);
+                if (!ev) return;
+                SEL setV = NSSelectorFromString(@"setIntegerValue:");
+                if ([ev respondsToSelector:setV])
+                    ((void(*)(id, SEL, int64_t))objc_msgSend)(ev, setV, down ? 1 : 0);
+                ((void(*)(id, SEL, id, id))objc_msgSend)(client, dsp, ev, nil);
+                n++;
+            };
+            sendObjC(0x30, YES);
+            sendObjC(0xE9, YES);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+              sendObjC(0xE9, NO);
+              sendObjC(0x30, NO);
+              SGLog(@"doScreenshot: ObjC combo dispatched (%d)", n);
+            });
+            return;
+        }
+
+        void *client = create(kCFAllocatorDefault);
+        if (!client) { SGLog(@"doScreenshot: no HID client"); return; }
+
+        // usage page 0x0C (consumer): 0x30 = side/power, 0xE9 = volume up.
+        void (^send)(uint32_t, BOOL) = ^(uint32_t usage, BOOL down) {
+            void *ev = evCreate(kCFAllocatorDefault, 0, 0, usage, down ? 1 : 0);
+            if (!ev) { SGLog(@"doScreenshot: event nil 0x%x", usage); return; }
+            dispatch((uint32_t)(uintptr_t)client, ev);
+            CFRelease((CFTypeRef)ev);
+        };
+
+        send(0x30, YES);
+        send(0xE9, YES);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+          send(0xE9, NO);
+          send(0x30, NO);
+          SGLog(@"doScreenshot: combo dispatched");
+        });
       } @catch (NSException *e) {
-          // Nothing about a screenshot may ever take SpringBoard down.
+          // A screenshot must never be able to take SpringBoard down.
           SGLog(@"doScreenshot: aborted %@", e.reason);
       }
     });
@@ -1985,7 +2005,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.4.3 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.5.0 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
