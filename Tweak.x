@@ -1533,6 +1533,11 @@ static void sbLock(void) {
 // SpringBoard runs as mobile, so superuser privileges come from a setuid
 // helper if one exists; otherwise try the plain path and report the result.
 static void doLock(void);
+// 3.7.2: double-tap pairing state, shared by every window's recogniser.
+static BOOL gTapArmed = NO;
+static NSTimeInterval gLastTapTime = 0;
+static CGPoint gLastTapPoint = {0, 0};
+
 static void doScreenshot(void);
 
 static BOOL doSystemAction(NSString *tool) {
@@ -1900,12 +1905,29 @@ static char kAttachedKey;
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     UITouch *t = [touches anyObject];
     if (t) {
-        // -locationInWindow is the raw touch coordinate; it does not depend on
+        // -locationInView: is the raw screen coordinate; it does not depend on
         // which view the recogniser is attached to.
         self.downPoint = [t locationInView:nil];
         self.hasDown = YES;
     }
     [super touchesBegan:touches withEvent:event];
+}
+
+// 3.7.2: reject touches that start nowhere near the status bar.
+//
+// Now that this reports single taps (the pairing happens in the handler),
+// every touch on the device would otherwise reach it, and a recogniser left
+// in Possible holds back the app's own taps until it settles.
+//
+// -gestureRecognizerShouldBegin: is the right hook: it is consulted before
+// the recogniser starts tracking, so returning NO costs the app nothing.
+// 80pt is a generous ceiling - the handler still checks the exact band.
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
+    // UIGestureRecognizer implements this only to consult its delegate, and
+    // it is not part of UITapGestureRecognizer's public interface, so there
+    // is no super to chain to - the default is YES.
+    if (self.hasDown && self.downPoint.y > 80.0) return NO;
+    return YES;
 }
 @end
 
@@ -2033,7 +2055,14 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         SGTapRecognizer *g =
             [[SGTapRecognizer alloc] initWithTarget:self
                                              action:@selector(onCornerTap:)];
-        g.numberOfTapsRequired = 2; g.delegate = self;
+        // 3.7.2: numberOfTapsRequired = 1, not 2.
+        //
+        // With 2 the recogniser had to hold a decision across both taps, and
+        // the status bar is exactly where iOS runs its own "tap to scroll to
+        // top" recogniser. Ours kept being failed midway, so a double tap
+        // worked only sometimes. A single tap reports reliably; the pairing
+        // is decided by us in onCornerTap:.
+        g.numberOfTapsRequired = 1; g.delegate = self;
         g.cancelsTouchesInView = NO;   // don't eat app taps
         [window addGestureRecognizer:g];
     }
@@ -2215,12 +2244,47 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         if (best > 20.0) bandH = best;
     } @catch (__unused NSException *e) { }
 
-    BOOL inBand = (p.y >= 0 && p.y <= bandH);
-    SGLog(@"doubleTap %.0f,%.0f band[0..%.0f] -> %d (win=%@ %.0fx%.0f)",
-          p.x, p.y, bandH, inBand, NSStringFromClass([win class]),
+    // A thumb aiming at the Dynamic Island lands a little below the exact
+    // safe-area line, so allow a small margin and a hair above zero for
+    // rounding. Nowhere near mid-screen.
+    BOOL inBand = (p.y >= -6.0 && p.y <= bandH + 14.0);
+    SGLog(@"tap %.0f,%.0f band[-6..%.0f] -> %d (win=%@ %.0fx%.0f)",
+          p.x, p.y, bandH + 14.0, inBand, NSStringFromClass([win class]),
           win ? win.bounds.size.width : 0, win ? win.bounds.size.height : 0);
 
-    if (inBand && gCornerTapPower) doPowerMenu();
+    if (!inBand) {
+        // Tapping elsewhere means the user is not aiming at this gesture.
+        gTapArmed = NO;
+        return;
+    }
+    if (!gCornerTapPower) return;
+
+    // 3.7.2: pair the taps here instead of inside the recogniser.
+    //
+    // Shared across every window: SpringBoard owns several full-screen
+    // windows and each carries its own recogniser, so per-instance state
+    // would see only half of a double tap.
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    NSTimeInterval dt = now - gLastTapTime;
+    CGFloat dx = p.x - gLastTapPoint.x;
+    CGFloat dy = p.y - gLastTapPoint.y;
+    BOOL sameSpot = (sqrt(dx * dx + dy * dy) <= 44.0);
+
+    // One physical tap can be reported by more than one attached window.
+    // Identical point within 60ms is the same tap, not a second one.
+    if (gTapArmed && dt < 0.06 && sameSpot) return;
+
+    if (gTapArmed && dt > 0.0 && dt <= 0.55 && sameSpot) {
+        gTapArmed = NO;             // consume
+        SGLog(@"doubleTap confirmed dt=%.2f", dt);
+        doPowerMenu();
+        return;
+    }
+
+    gTapArmed = YES;
+    gLastTapTime = now;
+    gLastTapPoint = p;
+    SGLog(@"tap armed, waiting for the second (dt=%.2f spot=%d)", dt, sameSpot);
 }
 
 - (void)onTwoFingerDown:(UIGestureRecognizer *)g {
@@ -2305,7 +2369,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.7.1 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.7.2 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
