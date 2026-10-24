@@ -1622,18 +1622,14 @@ static void doScreenshot(void) {
     vibrate();
     SGLog(@"doScreenshot enter isSpringBoard=%d", isSpringBoard());
 
-    // 2.5.1 — why the previous attempts crashed:
+    // 2.6.0 — every private screenshot API has moved on iOS 17 and the raw
+    // HID/C symbols are unusable (see 2.5.x history: wrong arity destroyed
+    // the stack and produced safe mode).
     //
-    //  * CARenderServerRenderDisplay: 4-arg call into a 5-arg function.
-    //  * IOHIDEventCreateKeyboardEvent: declared with 5 args, the real one
-    //    takes 7, AND I cast the 64-bit client pointer down to uint32_t when
-    //    dispatching. Either is enough to smash the stack / deref garbage.
-    //
-    // Raw C function pointers are simply too fragile here: every one of these
-    // private symbols has an undocumented arity that differs per iOS build.
-    // Objective-C message sends do not care about arity, so the whole thing is
-    // done through objc_msgSend with respondsToSelector guards instead. That
-    // cannot corrupt the stack no matter what the real prototype is.
+    // The one thing that never moved is the screenshot *service* itself:
+    // SpringBoard asks SpringBoardServices for it.  Use the Objective-C
+    // screenshot manager if present, and otherwise take the picture ourselves
+    // from the render server through a method that IS safe to call.
     if (!isSpringBoard()) {
         notify_post(kNotifyShot);
         return;
@@ -1641,72 +1637,95 @@ static void doScreenshot(void) {
 
     dispatch_async(dispatch_get_main_queue(), ^{
       @try {
-        // IOKit must be loaded before its classes are registered.
-        void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",
-                             RTLD_NOW);
-        if (!iokit) iokit = dlopen("/usr/lib/libIOKit.dylib", RTLD_NOW);
-        SGLog(@"doScreenshot: iokit=%p", iokit);
-
-        Class cliCls = NSClassFromString(@"IOHIDEventSystemClient");
-        Class evCls  = NSClassFromString(@"IOHIDEvent");
-        SGLog(@"doScreenshot: client=%@ event=%@", cliCls, evCls);
-        if (!cliCls || !evCls) { SGLog(@"doScreenshot: classes missing"); return; }
-
-        id client = nil;
-        for (NSString *n in @[ @"sharedInstance", @"create" ]) {
-            SEL sel = NSSelectorFromString(n);
-            if (![cliCls respondsToSelector:sel]) continue;
-            client = ((id(*)(id, SEL))objc_msgSend)(cliCls, sel);
-            if (client) { SGLog(@"doScreenshot: client via +%@", n); break; }
+        // ---- 1. SpringBoard's own screenshot manager (iOS 14-17) ----
+        // Try every plausible name; whichever exists tells us the version.
+        // 2.6.0: enumerate everything that looks like a screenshot class so a
+        // single log line identifies the right one for this iOS build.
+        {
+            unsigned int count = 0;
+            Class *all = objc_copyClassList(&count);
+            NSMutableString *hits = [NSMutableString string];
+            for (unsigned int i = 0; i < count; i++) {
+                const char *nm = class_getName(all[i]);
+                if (!nm) continue;
+                if (strcasestr(nm, "shot") || strcasestr(nm, "screenShot")) {
+                    [hits appendFormat:@" %s", nm];
+                    if (hits.length > 900) break;
+                }
+            }
+            if (all) free(all);
+            SGLog(@"doScreenshot: screenshot classes =%@", hits);
         }
-        if (!client) { SGLog(@"doScreenshot: no client"); return; }
 
-        // Pick whichever event factory and dispatch selector actually exist.
-        NSArray *factories = @[ @"keyboardEvent:", @"keyboardEvent:options:" ];
-        NSString *factory = nil;
-        for (NSString *f in factories)
-            if ([evCls respondsToSelector:NSSelectorFromString(f)]) { factory = f; break; }
-        NSArray *senders = @[ @"dispatchEvent:toDispatcher:", @"dispatchEvent:" ];
-        NSString *sender = nil;
-        for (NSString *d in senders)
-            if ([client respondsToSelector:NSSelectorFromString(d)]) { sender = d; break; }
+        NSArray *managers = @[ @"SBScreenShotter",
+                               @"SBScreenshotManager",
+                               @"SBScreenCaptureManager",
+                               @"SBSystemScreenshotManager" ];
+        for (NSString *mn in managers) {
+            Class c = NSClassFromString(mn);
+            SGLog(@"doScreenshot: %@ -> %@", mn, c);
+            if (!c) continue;
 
-        SGLog(@"doScreenshot: factory=%@ sender=%@", factory, sender);
-        if (!factory || !sender) { SGLog(@"doScreenshot: no usable selectors"); return; }
+            id inst = nil;
+            SEL sh = NSSelectorFromString(@"sharedInstance");
+            if ([c respondsToSelector:sh])
+                inst = ((id(*)(id, SEL))objc_msgSend)(c, sh);
+            if (!inst) inst = c;
 
-        // usage page 0x0C (consumer): 0x30 = side button, 0xE9 = volume up.
-        __block int sent = 0;
-        void (^send)(uint32_t, BOOL) = ^(uint32_t usage, BOOL down) {
-            id ev = nil;
-            if ([factory hasSuffix:@"options:"])
-                ev = ((id(*)(id, SEL, uint32_t, uint64_t))objc_msgSend)(
-                        evCls, NSSelectorFromString(factory), usage, 0);
-            else
-                ev = ((id(*)(id, SEL, uint32_t))objc_msgSend)(
-                        evCls, NSSelectorFromString(factory), usage);
-            if (!ev) { SGLog(@"doScreenshot: nil event 0x%x", usage); return; }
+            NSArray *acts = @[ @"saveScreenshotWithCompletion:",
+                               @"takeScreenshot",
+                               @"saveScreenshot",
+                               @"captureScreenshot",
+                               @"_saveScreenshot" ];
+            for (NSString *an in acts) {
+                SEL sel = NSSelectorFromString(an);
+                BOOL has = [inst respondsToSelector:sel];
+                if (!has && inst != c) has = [c respondsToSelector:sel];
+                if (!has) continue;
+                @try {
+                    if ([an hasSuffix:@":"])
+                        ((void(*)(id, SEL, id))objc_msgSend)(inst, sel, nil);
+                    else
+                        ((void(*)(id, SEL))objc_msgSend)(inst, sel);
+                    SGLog(@"doScreenshot: %@ %@ OK", mn, an);
+                    return;
+                } @catch (NSException *e) {
+                    SGLog(@"doScreenshot: %@ %@ threw %@", mn, an, e.reason);
+                }
+            }
+        }
 
-            SEL setV = NSSelectorFromString(@"setIntegerValue:");
-            if ([ev respondsToSelector:setV])
-                ((void(*)(id, SEL, int64_t))objc_msgSend)(ev, setV, down ? 1 : 0);
+        // ---- 2. Capture from the window server, then save it ourselves ----
+        // CPSScreenServerCreateImageForDisplay is NOT used: its arity is
+        // undocumented. Instead composite through the public UIScreen API and
+        // accept that only SpringBoard-owned layers are captured - this is a
+        // last-resort so the menu item still produces a file.
+        UIScreen *scr = [UIScreen mainScreen];
+        CGRect full = scr.bounds;
+        UIGraphicsBeginImageContextWithOptions(full.size, NO, scr.scale);
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.hidden || w.alpha < 0.01) continue;
+            if (w.windowLevel >= 4000) continue;      // our own panel
+            @try { [w drawViewHierarchyInRect:full afterScreenUpdates:NO]; }
+            @catch (__unused NSException *e) { }
+        }
+        UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        if (!img) { SGLog(@"doScreenshot: nothing captured"); return; }
 
-            if ([sender isEqualToString:@"dispatchEvent:"])
-                ((void(*)(id, SEL, id))objc_msgSend)(client, NSSelectorFromString(sender), ev);
-            else
-                ((void(*)(id, SEL, id, id))objc_msgSend)(client, NSSelectorFromString(sender), ev, nil);
-            sent++;
-        };
-
-        send(0x30, YES);
-        send(0xE9, YES);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-          send(0xE9, NO);
-          send(0x30, NO);
-          SGLog(@"doScreenshot: combo dispatched (%d)", sent);
-        });
+        NSData *jpg = UIImageJPEGRepresentation(img, 0.95);
+        NSString *path = [NSString stringWithFormat:
+            @"/var/mobile/Library/Preferences/SquidShot-%.0f.JPG",
+            [[NSDate date] timeIntervalSince1970]];
+        if (jpg && [jpg writeToFile:path atomically:YES]) {
+            SGLog(@"doScreenshot: window-only capture -> %@ (%lu bytes)",
+                  path, (unsigned long)jpg.length);
+            // Tell Photos to index it, so it shows up in the camera roll.
+            notify_post("com.apple.mobileslideshow.assets.changed");
+        } else {
+            SGLog(@"doScreenshot: write failed");
+        }
       } @catch (NSException *e) {
-          // A screenshot must never be able to take SpringBoard down.
           SGLog(@"doScreenshot: aborted %@", e.reason);
       }
     });
@@ -1988,7 +2007,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.5.1 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.6.0 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
