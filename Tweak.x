@@ -1896,6 +1896,59 @@ static char kAttachedKey;
 }
 @end
 
+// 3.5.0 — two-finger ANY gesture -> screenshot.
+//
+// Previously this was a UISwipeGestureRecognizer limited to swipe-down, so
+// two fingers had to travel in one specific direction. UISwipeGestureRecognizer
+// cannot express "any direction" - it takes a single direction mask and spaces
+// is a bitmask of allowed directions that still all have to be monotonic swipes.
+//
+// A UIGestureRecognizer subclass that fires the moment a second finger lands
+// covers every two-finger gesture at once: pinch, rotate, swipe in any
+// direction, or just two fingers tapping. Nothing needs to move first.
+@interface SGTwoFingerRecognizer : UIGestureRecognizer
+@end
+
+@implementation SGTwoFingerRecognizer
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    // allTouches holds every finger currently on the screen, including ones
+    // that landed in an earlier callback. So the count hits exactly 2 on the
+    // frame the second finger arrives - that is the trigger.
+    NSUInteger n = event.allTouches.count;
+
+    if (n == 2 && self.state == UIGestureRecognizerStatePossible) {
+        self.state = UIGestureRecognizerStateRecognized;
+        return;
+    }
+    if (n > 2) {
+        // Three fingers is the three-finger gestures' business, not ours.
+        self.state = UIGestureRecognizerStateFailed;
+        return;
+    }
+    [super touchesBegan:touches withEvent:event];
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    // Recognised on touch-down, so nothing to do; keep the state intact.
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (self.state == UIGestureRecognizerStatePossible)
+        self.state = UIGestureRecognizerStateFailed;
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (self.state == UIGestureRecognizerStatePossible)
+        self.state = UIGestureRecognizerStateFailed;
+}
+
+// Never block the app's own gestures: a two-finger pinch must still zoom.
+- (BOOL)canPreventGestureRecognizer:(UIGestureRecognizer *)other { return NO; }
+- (BOOL)canBePreventedByGestureRecognizer:(UIGestureRecognizer *)other { return NO; }
+
+@end
+
 static char kPanelPanKey;
 
 @implementation SGHandler
@@ -1938,12 +1991,10 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         [window addGestureRecognizer:g];
     }
     if (gTwoFingerScreenshot) {
-        // 2.1.0: two-finger swipe DOWN takes a screenshot.
-        UISwipeGestureRecognizer *g =
-            [[UISwipeGestureRecognizer alloc] initWithTarget:self
-                                                      action:@selector(onTwoFingerDown:)];
-        g.direction = UISwipeGestureRecognizerDirectionDown;
-        g.numberOfTouchesRequired = 2;
+        // 2.1.0: two-finger swipe down. 3.5.0: any two-finger gesture.
+        SGTwoFingerRecognizer *g =
+            [[SGTwoFingerRecognizer alloc] initWithTarget:self
+                                                   action:@selector(onTwoFingerDown:)];
         g.cancelsTouchesInView = NO;
         g.delegate = self;
         [window addGestureRecognizer:g];
@@ -2125,9 +2176,9 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     if (inBand && gCornerTapPower) doPowerMenu();
 }
 
-- (void)onTwoFingerDown:(UISwipeGestureRecognizer *)g {
+- (void)onTwoFingerDown:(UIGestureRecognizer *)g {
     if (!gEnabled || !gTwoFingerScreenshot) return;
-    SGLog(@"twoFingerDown -> screenshot");
+    SGLog(@"twoFingerAny -> screenshot");
     doScreenshot();
 }
 
@@ -2195,7 +2246,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.4.2 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.5.0 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
