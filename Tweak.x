@@ -577,8 +577,6 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
     _nameLabel.textAlignment = NSTextAlignmentCenter;
     _nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     _nameLabel.userInteractionEnabled = NO;
-    // 3.6.0: 面板里不显示应用名，只留图标。
-    _nameLabel.hidden = YES;
     [self addSubview:_nameLabel];
 
     _removeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -603,10 +601,8 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
 
     if (_vertical) {
         // 2.9.1: icon on top, label underneath (10pt), centred in the strip.
-        // 3.6.0: label hidden, so centre the icon alone instead of reserving
-        // 16pt of vertical space for text that is never drawn.
         CGFloat iconSize = 40.0;
-        CGFloat blockH = _nameLabel.hidden ? iconSize : iconSize + 4.0 + 12.0;
+        CGFloat blockH = iconSize + 4.0 + 12.0;
         CGFloat top = (h - blockH) / 2.0;
         _iconView.frame = CGRectMake((w - iconSize) / 2.0, top, iconSize, iconSize);
         _iconView.layer.cornerRadius = iconSize * 0.225;
@@ -619,9 +615,7 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
     }
 
     CGFloat iconSize = MIN(w - 6, 60.0);
-    // 3.6.0: no label under the icon, so centre the icon vertically as well.
-    CGFloat iconTop = _nameLabel.hidden ? (h - iconSize) / 2.0 : 0.0;
-    _iconView.frame = CGRectMake((w - iconSize) / 2, iconTop, iconSize, iconSize);
+    _iconView.frame = CGRectMake((w - iconSize) / 2, 0, iconSize, iconSize);
     _iconView.layer.cornerRadius = iconSize * 0.225;
     _nameLabel.textAlignment = NSTextAlignmentCenter;
     _nameLabel.font = [UIFont systemFontOfSize:10.5];
@@ -690,7 +684,9 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
 
 
     _titleLabel = [[UILabel alloc] init];
-    _titleLabel.text = @"应用";
+    // 3.6.1: 主面板不显示"应用"两个字。选择器仍复用这个 label 显示
+    // "添加应用"，所以只清空初值，不删控件。
+    _titleLabel.text = @"";
     _titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
     _titleLabel.textColor = [UIColor whiteColor];
     [_sheet addSubview:_titleLabel];
@@ -780,9 +776,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         contentH = MIN(maxH, s.height * 0.8);
     } else {
         NSInteger n = [self panelItems].count + 1;   // + "add" tile
-        // 3.6.0: no label under the icon, so rows can be shorter than the
-        // 58pt that used to hold icon + text.
-        CGFloat rowH = 50;
+        CGFloat rowH = 58;
         contentH = headerH + n * rowH + 12;
         contentH = MIN(MAX(contentH, headerH + rowH), maxH);
     }
@@ -848,7 +842,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     CGFloat pad = 10;
     CGFloat tileW = w - pad * 2;
     CGFloat rowGap = 6;
-    CGFloat rowH = 50;   // 3.6.0: icon-only rows
+    CGFloat rowH = 58;
 
     NSInteger total = items.count + 1;
     for (NSInteger i = 0; i < total; i++) {
@@ -861,14 +855,12 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
             tile.addTile = YES;
             tile.iconView.image = [self plusIcon:40];
             tile.iconView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
-            // 3.6.0: 不再显示"添加"两个字，加号图标本身已经说明用途。
-            tile.nameLabel.text = nil;
+            tile.nameLabel.text = @"添加";
         } else {
             SGCatalogItem *it = items[i];
             tile.item = it;
             tile.iconView.image = SGIconQuick(it, CGSizeMake(40, 40));
-            // 3.6.0: 面板只显示图标，不显示应用名。
-            tile.nameLabel.text = nil;
+            tile.nameLabel.text = it.name ?: it.bundleID;
             tile.removeBtn.hidden = !_editing;
             [tile.removeBtn addTarget:self
                                action:@selector(removeTapped:)
@@ -1011,7 +1003,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     _scroll.hidden = NO;
     _table.hidden = YES;
     _loadingLabel.hidden = YES;
-    _titleLabel.text = @"应用";
+    _titleLabel.text = @"";
     [_editBtn setTitle:(_editing ? @"完成" : @"编辑") forState:UIControlStateNormal];
     [self layoutSheet];
 }
@@ -1110,7 +1102,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     _scroll.hidden = NO;
     _table.hidden = YES;
     _loadingLabel.hidden = YES;
-    _titleLabel.text = @"应用";
+    _titleLabel.text = @"";
     [_editBtn setTitle:@"编辑" forState:UIControlStateNormal];
     [self layoutSheet];
 
@@ -2320,7 +2312,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.6.0 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.6.1 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
