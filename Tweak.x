@@ -1734,6 +1734,28 @@ static char kAttachedKey;
 // at that moment is already above where the user actually put their finger.
 // On a tall box that never mattered; on a shallow bar-anchored band it pushes
 // the start point out of the zone. Remember the real starting point instead.
+// 2.8.3: UITapGestureRecognizer's -locationInView: returned (0,0) for every
+// tap inside SpringBoard, so the zone test never saw a real coordinate.
+// A tiny subclass keeps the screen-space point captured at touchesBegan,
+// which is exactly what the panel gesture already relies on.
+@interface SGTapRecognizer : UITapGestureRecognizer
+@property (nonatomic, assign) CGPoint downPoint;
+@property (nonatomic, assign) BOOL hasDown;
+@end
+
+@implementation SGTapRecognizer
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    UITouch *t = [touches anyObject];
+    if (t) {
+        // -locationInWindow is the raw touch coordinate; it does not depend on
+        // which view the recogniser is attached to.
+        self.downPoint = [t locationInView:nil];
+        self.hasDown = YES;
+    }
+    [super touchesBegan:touches withEvent:event];
+}
+@end
+
 static char kPanelPanKey;
 
 @implementation SGHandler
@@ -1767,10 +1789,10 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
           (double)window.windowLevel);
 
     // 2.1.0: left-edge back gesture removed at the user's request.
-    if (gCornerTapLock || gCornerTapScreenshot) {
-        UITapGestureRecognizer *g =
-            [[UITapGestureRecognizer alloc] initWithTarget:self
-                                                    action:@selector(onCornerTap:)];
+    if (gCornerTapPower || gCornerTapLock) {
+        SGTapRecognizer *g =
+            [[SGTapRecognizer alloc] initWithTarget:self
+                                             action:@selector(onCornerTap:)];
         g.numberOfTapsRequired = 2; g.delegate = self;
         g.cancelsTouchesInView = NO;   // don't eat app taps
         [window addGestureRecognizer:g];
@@ -1918,16 +1940,23 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     if (!win) win = g.view.superview.window;
     if (!win) win = [UIApplication sharedApplication].keyWindow;
 
+    // Prefer the point captured at touchesBegan: -locationInView: returns
+    // (0,0) here, which is why the band test was always true.
     CGPoint p = CGPointZero;
-    CGRect scrB = [UIScreen mainScreen].bounds;
-    if (win) {
-        CGPoint inWin = [g locationInView:win];
-        if (win.bounds.size.width >= scrB.size.width * 0.9) {
-            p = inWin;                                  // full-screen window
-        } else {
-            // small overlay: add its own offset within the screen
-            p = CGPointMake(inWin.x + win.frame.origin.x,
-                            inWin.y + win.frame.origin.y);
+    if ([g isKindOfClass:[SGTapRecognizer class]]) {
+        SGTapRecognizer *tr = (SGTapRecognizer *)g;
+        if (tr.hasDown) p = tr.downPoint;
+    }
+    if (p.x == 0 && p.y == 0) {
+        CGRect scrB = [UIScreen mainScreen].bounds;
+        if (win) {
+            CGPoint inWin = [g locationInView:win];
+            if (win.bounds.size.width >= scrB.size.width * 0.9) {
+                p = inWin;
+            } else {
+                p = CGPointMake(inWin.x + win.frame.origin.x,
+                                inWin.y + win.frame.origin.y);
+            }
         }
     }
 
@@ -2026,7 +2055,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.8.2 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.8.3 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
