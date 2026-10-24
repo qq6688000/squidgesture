@@ -577,6 +577,8 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
     _nameLabel.textAlignment = NSTextAlignmentCenter;
     _nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     _nameLabel.userInteractionEnabled = NO;
+    // 3.6.0: 面板里不显示应用名，只留图标。
+    _nameLabel.hidden = YES;
     [self addSubview:_nameLabel];
 
     _removeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -601,8 +603,10 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
 
     if (_vertical) {
         // 2.9.1: icon on top, label underneath (10pt), centred in the strip.
+        // 3.6.0: label hidden, so centre the icon alone instead of reserving
+        // 16pt of vertical space for text that is never drawn.
         CGFloat iconSize = 40.0;
-        CGFloat blockH = iconSize + 4.0 + 12.0;
+        CGFloat blockH = _nameLabel.hidden ? iconSize : iconSize + 4.0 + 12.0;
         CGFloat top = (h - blockH) / 2.0;
         _iconView.frame = CGRectMake((w - iconSize) / 2.0, top, iconSize, iconSize);
         _iconView.layer.cornerRadius = iconSize * 0.225;
@@ -615,7 +619,9 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
     }
 
     CGFloat iconSize = MIN(w - 6, 60.0);
-    _iconView.frame = CGRectMake((w - iconSize) / 2, 0, iconSize, iconSize);
+    // 3.6.0: no label under the icon, so centre the icon vertically as well.
+    CGFloat iconTop = _nameLabel.hidden ? (h - iconSize) / 2.0 : 0.0;
+    _iconView.frame = CGRectMake((w - iconSize) / 2, iconTop, iconSize, iconSize);
     _iconView.layer.cornerRadius = iconSize * 0.225;
     _nameLabel.textAlignment = NSTextAlignmentCenter;
     _nameLabel.font = [UIFont systemFontOfSize:10.5];
@@ -670,7 +676,16 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
     _sheet.layer.cornerRadius = 30;
     _sheet.layer.cornerCurve = kCACornerCurveContinuous;
     _sheet.clipsToBounds = YES;
-    _sheet.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.97];
+    // 3.6.0: 半透明面板背景。
+    //
+    // Was 0.97, effectively opaque. Now 0.62 - the underlying app genuinely
+    // shows through while white text still reads clearly.
+    //
+    // Deliberately NOT a UIVisualEffectView: v1.5.0 tried a blur here and it
+    // put a rendering load on SpringBoard that crashed it. A plain translucent
+    // colour gets the same "you can see through it" effect with none of that
+    // risk.
+    _sheet.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.62];
     [self.view addSubview:_sheet];
 
 
@@ -765,7 +780,9 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         contentH = MIN(maxH, s.height * 0.8);
     } else {
         NSInteger n = [self panelItems].count + 1;   // + "add" tile
-        CGFloat rowH = 58;
+        // 3.6.0: no label under the icon, so rows can be shorter than the
+        // 58pt that used to hold icon + text.
+        CGFloat rowH = 50;
         contentH = headerH + n * rowH + 12;
         contentH = MIN(MAX(contentH, headerH + rowH), maxH);
     }
@@ -831,7 +848,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     CGFloat pad = 10;
     CGFloat tileW = w - pad * 2;
     CGFloat rowGap = 6;
-    CGFloat rowH = 58;
+    CGFloat rowH = 50;   // 3.6.0: icon-only rows
 
     NSInteger total = items.count + 1;
     for (NSInteger i = 0; i < total; i++) {
@@ -844,12 +861,14 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
             tile.addTile = YES;
             tile.iconView.image = [self plusIcon:40];
             tile.iconView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
-            tile.nameLabel.text = @"添加";
+            // 3.6.0: 不再显示"添加"两个字，加号图标本身已经说明用途。
+            tile.nameLabel.text = nil;
         } else {
             SGCatalogItem *it = items[i];
             tile.item = it;
             tile.iconView.image = SGIconQuick(it, CGSizeMake(40, 40));
-            tile.nameLabel.text = it.name ?: it.bundleID;
+            // 3.6.0: 面板只显示图标，不显示应用名。
+            tile.nameLabel.text = nil;
             tile.removeBtn.hidden = !_editing;
             [tile.removeBtn addTarget:self
                                action:@selector(removeTapped:)
@@ -2301,7 +2320,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.5.1 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.6.0 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
