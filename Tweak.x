@@ -1393,6 +1393,73 @@ static void sbSleepDisplay(void) {
         }
     }
 
+    // ---- 2.9.6: real backlight off through BLSBacklight ----
+    // The class dump showed the live names are BLS* (BacklightServices), not
+    // the old SB* ones. BLSBacklightChangeRequest carries a requested activity
+    // state; requesting inactive (0) is what actually stops the panel.
+    @try {
+        void *h = dlopen("/System/Library/PrivateFrameworks/"
+                         "BacklightServices.framework/BacklightServices",
+                         RTLD_NOW);
+        SGLog(@"sbSleepDisplay: BacklightServices=%p", h);
+
+        Class blCls  = NSClassFromString(@"BLSBacklight");
+        Class reqCls = NSClassFromString(@"BLSBacklightChangeRequest");
+        SGLog(@"sbSleepDisplay: BLSBacklight=%@ request=%@", blCls, reqCls);
+
+        id backend = nil;
+        if (blCls) {
+            for (NSString *n in @[ @"sharedBacklight", @"sharedInstance" ]) {
+                SEL sel = NSSelectorFromString(n);
+                if ([blCls respondsToSelector:sel]) {
+                    backend = ((id(*)(id, SEL))objc_msgSend)(blCls, sel);
+                    if (backend) { SGLog(@"sbSleepDisplay: backlight +%@", n); break; }
+                }
+            }
+        }
+
+        if (backend && reqCls) {
+            NSArray *sels = @[ @"requestBacklightChangeToState:sourceEvent:",
+                               @"requestBacklightChangeToState:",
+                               @"performBacklightChangeToState:" ];
+            for (NSString *sn in sels) {
+                SEL sel = NSSelectorFromString(sn);
+                if (![backend respondsToSelector:sel]) continue;
+                @try {
+                    if ([sn hasSuffix:@"sourceEvent:"])
+                        ((void(*)(id, SEL, int64_t, id))objc_msgSend)(backend, sel, 0, nil);
+                    else
+                        ((void(*)(id, SEL, int64_t))objc_msgSend)(backend, sel, 0);
+                    SGLog(@"sbSleepDisplay: BLSBacklight -%@", sn);
+                    break;
+                } @catch (NSException *e) {
+                    SGLog(@"sbSleepDisplay: -%@ threw %@", sn, e.reason);
+                }
+            }
+        }
+
+        if (reqCls) {
+            SEL mk = NSSelectorFromString(
+                @"requestWithRequestedActivityState:explanation:timestamp:sourceEvent:");
+            if ([reqCls respondsToSelector:mk]) {
+                id req = ((id(*)(id, SEL, int64_t, id, double, int64_t))
+                          objc_msgSend)(reqCls, mk, 0, @"SquidGesture", 0.0, 0);
+                SGLog(@"sbSleepDisplay: request=%@", req ? @"built" : @"nil");
+                if (req && backend) {
+                    SEL send = NSSelectorFromString(@"performChangeRequest:");
+                    if ([backend respondsToSelector:send]) {
+                        ((void(*)(id, SEL, id))objc_msgSend)(backend, send, req);
+                        SGLog(@"sbSleepDisplay: performChangeRequest");
+                    }
+                }
+            } else {
+                SGLog(@"sbSleepDisplay: request factory missing");
+            }
+        }
+    } @catch (NSException *e) {
+        SGLog(@"sbSleepDisplay: BLS threw %@", e.reason);
+    }
+
     // ---- guaranteed: zero the screen brightness ----
     // -[UIScreen brightness] is public API. Setting it to 0 blacks the panel
     // immediately, which is what "熄屏" looks like even when the private
@@ -2192,7 +2259,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.9.5 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.9.6 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
