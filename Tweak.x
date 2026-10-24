@@ -1924,13 +1924,18 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     // 2.8.0: the trigger is only the status-bar band, level with the Dynamic
     // Island - not the whole screen.  Height comes from the safe-area top
     // inset (falls back to a sane default when the window reports 0).
-    CGFloat bandH = 60.0;
+    // Height == the real status bar (== the Dynamic Island band), no padding.
+    // onCornerTap fires for EVERY window, so take the tallest safe-area top
+    // we can see rather than whichever window happened to own the tap.
+    CGFloat bandH = 59.0;
     @try {
-        UIWindow *keyWin = win ?: [UIApplication sharedApplication].keyWindow;
-        if (keyWin) {
-            UIEdgeInsets safe = keyWin.safeAreaInsets;
-            if (safe.top > 20.0) bandH = safe.top + 10.0;
+        CGFloat best = 0;
+        for (UIWindow *_w in [UIApplication sharedApplication].windows) {
+            CGFloat t = _w.safeAreaInsets.top;
+            if (t > best) best = t;
         }
+        if (best <= 0 && win) best = win.safeAreaInsets.top;
+        if (best > 20.0) bandH = best;
     } @catch (__unused NSException *e) { }
 
     BOOL inBand = (p.y >= 0 && p.y <= bandH);
@@ -2010,7 +2015,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.8.0 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.8.1 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
