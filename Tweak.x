@@ -1384,87 +1384,126 @@ static void sbHome(void) {
 //
 // SBLockDevice already handles BOTH locking AND screen-off (that is what
 // locking does), so no separate sleep call is needed. Just call it and stop.
-// 3.4.1 — the blanking call DID work (screen went dark for ~1s) and then
-// SpringBoard crashed. That is a state mismatch, not a bad symbol: we turned
-// the panel off behind SpringBoard's back, so its backlight bookkeeping
-// disagreed with reality and it died.
+// 3.4.2 — found it. The log from 3.4.1 lists the class that actually does
+// screen-off inside SpringBoard:
 //
-// Blanking alone is therefore not a viable route. Removed entirely.
+//   [SBScreenWakeAnimationController] present
+//     +sharedInstance
+//     -sleepForSource:target:completion:
+//     -sleepForSource:completion:
 //
-// The right way is to make the *system* sleep, the same way the side button
-// does. Everything below is a read-only probe: it enumerates the real method
-// signatures so the next build can call the correct one instead of guessing
-// (guessing is what produced the FBS and BLS crashes earlier).
+// This is the backlight state machine SpringBoard itself runs when the side
+// button is pressed. 3.4.0 crashed because we blanked the panel behind its
+// back through backboardd: the panel went dark while SpringBoard still
+// believed it was lit, so its animation state machine contradicted reality
+// and it died about a second later.
+//
+// Going through this controller keeps SpringBoard's own bookkeeping in sync,
+// which is the whole point.
+//
+// Called via NSInvocation rather than a raw msgSend cast: the invocation
+// builds its call frame from the real method signature, so a wrong guess
+// about argument types can no longer corrupt the stack. That is what killed
+// the earlier FBS and BLS attempts.
 
-static void sgDumpClass(const char *name) {
-    Class c = objc_getClass(name);
-    if (!c) { SGLog(@"  [%@] ABSENT", @(name)); return; }
-    SGLog(@"  [%@] present super=%@", @(name), NSStringFromClass(class_getSuperclass(c)));
+static void sbSleepViaAnimation(void) {
+    Class c = objc_getClass("SBScreenWakeAnimationController");
+    if (!c) { SGLog(@"sleep: SBScreenWakeAnimationController ABSENT"); return; }
 
-    unsigned int n = 0;
-    Method *cm = class_copyMethodList(object_getClass(c), &n);
-    NSMutableString *s = [NSMutableString string];
-    for (unsigned int i = 0; i < n && i < 24; i++)
-        [s appendFormat:@" +%s", sel_getName(method_getName(cm[i]))];
-    free(cm);
-    if (s.length) SGLog(@"     class methods:%@", s);
+    id ctrl = ((id(*)(id,SEL))objc_msgSend)(c, @selector(sharedInstance));
+    if (!ctrl) { SGLog(@"sleep: sharedInstance nil"); return; }
 
-    n = 0;
-    Method *im = class_copyMethodList(c, &n);
-    [s setString:@""];
-    for (unsigned int i = 0; i < n && i < 40; i++)
-        [s appendFormat:@" -%s", sel_getName(method_getName(im[i]))];
-    free(im);
-    if (s.length) SGLog(@"     instance methods:%@", s);
-}
+    if ([ctrl respondsToSelector:@selector(isSleepAnimationInProgress)])
+        SGLog(@"sleep: inProgress=%d",
+              ((BOOL(*)(id,SEL))objc_msgSend)(ctrl,
+                  @selector(isSleepAnimationInProgress)));
 
-static void sbSleepProbe(void) {
-    SGLog(@"=== sleep probe start ===");
-
-    // Which classes actually exist on this OS build?
-    static const char *names[] = {
-        "SBLockHardwareButton", "SBSleepWakeHardwareButtonInteraction",
-        "BLSBacklight", "BLSBacklightChangeRequest", "BLSBacklightChangeEvent",
-        "SBScreenSleepCoordinator", "SBBacklightController",
-        "SBLockScreenService", "SBSLockScreenService",
-        "SBIdleTimerGlobalCoordinator", "SBIdleTimerAggregateSource",
-        "SBScreenWakeAnimationController", "SBHardwareButtonController",
-        NULL
+    // Prefer the 2-argument form: fewer arguments means fewer chances to
+    // misjudge a type. Only fall back to the 3-argument one if it is absent.
+    SEL sels[2] = {
+        @selector(sleepForSource:completion:),
+        @selector(sleepForSource:target:completion:),
     };
-    for (int i = 0; names[i]; i++) sgDumpClass(names[i]);
 
-    // Is something holding the device awake? Playing audio (e.g. a keep-alive
-    // tweak) suppresses the normal lock -> screen-off transition, which would
-    // explain why locking never turned the panel off on its own.
-    Class app = objc_getClass("UIApplication");
-    if (app && [app respondsToSelector:@selector(sharedApplication)]) {
-        id a = ((id(*)(id,SEL))objc_msgSend)(app, @selector(sharedApplication));
-        if (a && [a respondsToSelector:@selector(isIdleTimerDisabled)])
-            SGLog(@"idleTimerDisabled=%d",
-                  ((BOOL(*)(id,SEL))objc_msgSend)(a, @selector(isIdleTimerDisabled)));
-        if (a && [a respondsToSelector:@selector(applicationState)])
-            SGLog(@"applicationState=%ld",
-                  (long)((NSInteger(*)(id,SEL))objc_msgSend)(a, @selector(applicationState)));
+    for (int k = 0; k < 2; k++) {
+        SEL sel = sels[k];
+        if (![ctrl respondsToSelector:sel]) {
+            SGLog(@"sleep: %@ absent", NSStringFromSelector(sel));
+            continue;
+        }
+
+        NSMethodSignature *sig = [ctrl methodSignatureForSelector:sel];
+        NSUInteger nargs = [sig numberOfArguments];
+        NSMutableString *enc = [NSMutableString string];
+        for (NSUInteger i = 0; i < nargs; i++)
+            [enc appendFormat:@"%s ", [sig getArgumentTypeAtIndex:i]];
+        SGLog(@"sleep: %@ args=%lu enc=%s", NSStringFromSelector(sel),
+              (unsigned long)nargs, [enc UTF8String]);
+
+        // Expect (self, _cmd, source, completion) or
+        //        (self, _cmd, source, target, completion).
+        NSUInteger need = (k == 0) ? 4 : 5;
+        if (nargs != need) {
+            SGLog(@"sleep: %@ arity mismatch, skipped", NSStringFromSelector(sel));
+            continue;
+        }
+
+        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+        [inv setTarget:ctrl];
+        [inv setSelector:sel];
+
+        long long src = 0;      // SBSBacklightChangeSource: unknown/other
+        double tgt = 0.0;       // target backlight level: off
+        id comp = nil;
+
+        const char *t2 = [sig getArgumentTypeAtIndex:2];
+        if (t2 && t2[0] == 'd') [inv setArgument:&tgt atIndex:2];
+        else                    [inv setArgument:&src atIndex:2];
+
+        if (k == 0) {
+            [inv setArgument:&comp atIndex:3];
+        } else {
+            const char *t3 = [sig getArgumentTypeAtIndex:3];
+            if (t3 && t3[0] == 'd') [inv setArgument:&tgt atIndex:3];
+            else                    [inv setArgument:&src atIndex:3];
+            [inv setArgument:&comp atIndex:4];
+        }
+
+        @try {
+            [inv invoke];
+            SGLog(@"sleep: invoked %@ OK", NSStringFromSelector(sel));
+            return;
+        } @catch (NSException *e) {
+            SGLog(@"sleep: %@ threw %@", NSStringFromSelector(sel), e.reason);
+        }
     }
-    SGLog(@"=== sleep probe end ===");
+    SGLog(@"sleep: all forms exhausted");
 }
 
-// Lock only. This is the behaviour that never crashed.
 static void sbUnblank(void) { }
 
 static void sbLock(void) {
     SGLog(@"sbLock enter");
     mach_port_t p = gGetPort ? gGetPort() : 0;
     SGLog(@"sbLock: port=%u lock=%p", p, gLockDevice);
+
+    // Step 1 - lock. Never crashed in any build.
     if (p && gLockDevice) {
         @try {
             gLockDevice(p, 1);
             SGLog(@"sbLock: SBLockDevice done");
         } @catch (NSException *e) {
-            SGLog(@"sbLock: threw %@", e.reason);
+            SGLog(@"sbLock: lock threw %@", e.reason);
         }
     }
-    sbSleepProbe();
+
+    // Step 2 - screen off, through SpringBoard's own state machine.
+    // Short delay so it fades from the lock screen, not the last app frame.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try { sbSleepViaAnimation(); }
+        @catch (NSException *e) { SGLog(@"sleep outer threw %@", e.reason); }
+    });
 }
 
 // 2.1.0: power menu (log out / restart) for the left half of the status bar.
@@ -2156,7 +2195,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.4.1 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.4.2 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
