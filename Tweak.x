@@ -1576,13 +1576,6 @@ static void sbPowerMenu(void) {
           doLock();
       }]];
 
-      [ac addAction:[UIAlertAction actionWithTitle:@"截图"
-                                            style:UIAlertActionStyleDefault
-                                          handler:^(__unused UIAlertAction *a) {
-          SGLog(@"menu: screenshot");
-          doScreenshot();
-      }]];
-
       [ac addAction:[UIAlertAction actionWithTitle:@"注销"
                                             style:UIAlertActionStyleDestructive
                                           handler:^(__unused UIAlertAction *a) {
@@ -1904,16 +1897,68 @@ static char kAttachedKey;
 @end
 
 @implementation SGTapRecognizer
+
+- (void)reset {
+    [super reset];
+    self.hasDown = NO;
+}
+
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     UITouch *t = [touches anyObject];
     if (t) {
-        // -locationInWindow is the raw touch coordinate; it does not depend on
+        // -locationInView: is the raw screen coordinate; it does not depend on
         // which view the recogniser is attached to.
         self.downPoint = [t locationInView:nil];
         self.hasDown = YES;
     }
     [super touchesBegan:touches withEvent:event];
 }
+
+// Count taps ourselves and report a double tap by setting Recognized on the
+// SECOND one. Doing this in the recogniser rather than in the action handler
+// keeps the timing decision out of the UI thread's busy periods.
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    UITouch *t = [touches anyObject];
+    if (!t) { [super touchesEnded:touches withEvent:event]; return; }
+
+    CFTimeInterval now = CACurrentMediaTime();
+    CGPoint p = self.hasDown ? self.downPoint : [t locationInView:nil];
+
+    // Shared across every window's recogniser. A double tap produces taps on
+    // several attached windows (SpringBoard has more than one full-screen
+    // window), and per-instance counters would each see only half the pair -
+    // which is precisely why the gesture felt unreliable.
+    static CFTimeInterval lastTapTime = 0;
+    static CGPoint lastTapPoint = {0, 0};
+    static BOOL hasLastTap = NO;
+
+    BOOL isDouble = NO;
+    if (hasLastTap) {
+        CFTimeInterval dt = now - lastTapTime;
+        CGFloat dx = p.x - lastTapPoint.x;
+        CGFloat dy = p.y - lastTapPoint.y;
+        // 0.5s and 40pt: the slop UIKit itself uses for double taps.
+        if (dt > 0.02 && dt <= 0.5 && sqrt(dx * dx + dy * dy) <= 40.0)
+            isDouble = YES;
+    }
+
+    if (isDouble) {
+        hasLastTap = NO;            // consume, so the next tap starts fresh
+        self.state = UIGestureRecognizerStateRecognized;
+        return;
+    }
+
+    lastTapTime = now;
+    lastTapPoint = p;
+    hasLastTap = YES;
+
+    [super touchesEnded:touches withEvent:event];
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [super touchesCancelled:touches withEvent:event];
+}
+
 @end
 
 // 3.5.1 — two-finger ANY gesture -> screenshot, but only once the gesture is
@@ -2040,7 +2085,11 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         SGTapRecognizer *g =
             [[SGTapRecognizer alloc] initWithTarget:self
                                              action:@selector(onCornerTap:)];
-        g.numberOfTapsRequired = 2; g.delegate = self;
+        // 3.7.0: 不再设 numberOfTapsRequired=2。
+        // 识别器要活过两次完整点击才成立，可 SpringBoard 自己的窗口上有系统
+        // 识别器在抢，我们经常在中途被判失败，所以双击时好时坏。
+        // 改成在 touchesBegan 里自己数点击，绕开这套状态机。
+        g.numberOfTapsRequired = 1; g.delegate = self;
         g.cancelsTouchesInView = NO;   // don't eat app taps
         [window addGestureRecognizer:g];
     }
@@ -2222,7 +2271,9 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         if (best > 20.0) bandH = best;
     } @catch (__unused NSException *e) { }
 
-    BOOL inBand = (p.y >= 0 && p.y <= bandH);
+    // 3.7.0: the exact status-bar height is a hard edge to hit with a thumb,
+    // so allow a little slack below it. Still nowhere near mid-screen.
+    BOOL inBand = (p.y >= 0 && p.y <= bandH + 12.0);
     SGLog(@"doubleTap %.0f,%.0f band[0..%.0f] -> %d (win=%@ %.0fx%.0f)",
           p.x, p.y, bandH, inBand, NSStringFromClass([win class]),
           win ? win.bounds.size.width : 0, win ? win.bounds.size.height : 0);
@@ -2312,7 +2363,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.6.1 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.7.0 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
