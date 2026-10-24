@@ -1362,18 +1362,27 @@ static void sbSleepDisplay(void) {
             backend = ((id(*)(id, SEL))objc_msgSend)(blCls, sel);
             if (backend) { SGLog(@"sbSleepDisplay: backlight via +%@", n); break; }
         }
-        if (!backend) {
-            // dump what BLSBacklight actually offers, once
-            static BOOL dumped = NO;
-            if (!dumped) {
-                dumped = YES;
-                unsigned int outCount = 0;
-                Method *ms = class_copyMethodList(blCls, &outCount);
-                NSMutableString *str = [NSMutableString string];
-                for (unsigned int i = 0; i < outCount && i < 40; i++)
-                    [str appendFormat:@" %@", NSStringFromSelector(method_getName(ms[i]))];
-                if (ms) free(ms);
-                SGLog(@"sbSleepDisplay: BLSBacklight methods =%@", str);
+        // Always dump the real API once - the previous run proved the instance
+        // exists but neither requestBacklightChangeToState: variant does.
+        static BOOL dumped = NO;
+        if (!dumped) {
+            dumped = YES;
+            NSMutableString *str = [NSMutableString string];
+            unsigned int outCount = 0;
+            Method *ms = class_copyMethodList(blCls, &outCount);
+            for (unsigned int i = 0; i < outCount; i++)
+                [str appendFormat:@" %@", NSStringFromSelector(method_getName(ms[i]))];
+            if (ms) free(ms);
+            SGLog(@"sbSleepDisplay: BLSBacklight methods =%@", str);
+
+            if (backend) {
+                NSMutableString *is = [NSMutableString string];
+                unsigned int ic = 0;
+                Method *im = class_copyMethodList(object_getClass(backend), &ic);
+                for (unsigned int i = 0; i < ic; i++)
+                    [is appendFormat:@" %@", NSStringFromSelector(method_getName(im[i]))];
+                if (im) free(im);
+                SGLog(@"sbSleepDisplay: BLSBacklight class methods =%@", is);
             }
         }
     }
@@ -1414,6 +1423,44 @@ static void sbSleepDisplay(void) {
                 }
             }
         }
+    }
+
+    // 3.1.1: BLSBacklight may not expose a public request method on 17.3.1.
+    // BLSBacklightChangeEvent carries the state change; the host applies it.
+    // Try the change-event class as well, and the SpringBoard-side executor.
+    @try {
+        Class evCls = NSClassFromString(@"BLSBacklightChangeEvent");
+        SGLog(@"sbSleepDisplay: BLSBacklightChangeEvent=%@", evCls);
+        if (evCls && backend) {
+            NSMutableString *es = [NSMutableString string];
+            unsigned int ec = 0;
+            Method *em = class_copyMethodList(evCls, &ec);
+            for (unsigned int i = 0; i < ec; i++)
+                [es appendFormat:@" %@", NSStringFromSelector(method_getName(em[i]))];
+            if (em) free(em);
+            SGLog(@"sbSleepDisplay: changeEvent methods =%@", es);
+        }
+
+        // The host side of BacklightServices owns the actual transition.
+        for (NSString *cn in @[ @"BLSBacklightSceneEnvironmentUpdater",
+                                @"BLSHBacklightService" ]) {
+            Class c = NSClassFromString(cn);
+            if (!c) continue;
+            id inst = nil;
+            SEL sh = NSSelectorFromString(@"sharedInstance");
+            if ([c respondsToSelector:sh])
+                inst = ((id(*)(id, SEL))objc_msgSend)(c, sh);
+            for (NSString *sn in @[ @"transitionToState:", @"setBacklightState:" ]) {
+                SEL sel = NSSelectorFromString(sn);
+                if (inst && [inst respondsToSelector:sel]) {
+                    ((void(*)(id, SEL, int64_t))objc_msgSend)(inst, sel, kInactive);
+                    SGLog(@"sbSleepDisplay: %@ -%@ 2", cn, sn);
+                    break;
+                }
+            }
+        }
+    } @catch (NSException *e) {
+        SGLog(@"sbSleepDisplay: extra BLS paths threw %@", e.reason);
     }
 
     // Side-button interaction: this is the one call that both locks and sleeps.
@@ -2223,7 +2270,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.1.0 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.1.1 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
