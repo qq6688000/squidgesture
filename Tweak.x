@@ -544,16 +544,17 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
     CGFloat h = self.bounds.size.height;
 
     if (_vertical) {
-        // one row: 40pt icon on the left, label filling the rest
+        // 2.9.1: icon on top, label underneath (10pt), centred in the strip.
         CGFloat iconSize = 40.0;
-        CGFloat left = 8.0;
-        _iconView.frame = CGRectMake(left, (h - iconSize) / 2.0, iconSize, iconSize);
+        CGFloat blockH = iconSize + 4.0 + 12.0;
+        CGFloat top = (h - blockH) / 2.0;
+        _iconView.frame = CGRectMake((w - iconSize) / 2.0, top, iconSize, iconSize);
         _iconView.layer.cornerRadius = iconSize * 0.225;
-        CGFloat textX = left + iconSize + 9.0;
-        _nameLabel.textAlignment = NSTextAlignmentLeft;
-        _nameLabel.font = [UIFont systemFontOfSize:12.5];
-        _nameLabel.frame = CGRectMake(textX, (h - 16) / 2.0, w - textX - 8, 16);
-        _removeBtn.frame = CGRectMake(left - 4, (h - iconSize) / 2.0 - 7, 20, 20);
+        _nameLabel.textAlignment = NSTextAlignmentCenter;
+        _nameLabel.font = [UIFont systemFontOfSize:10.0];
+        _nameLabel.frame = CGRectMake(2, top + iconSize + 4.0, w - 4, 12);
+        _removeBtn.frame = CGRectMake(_iconView.frame.origin.x - 5,
+                                      _iconView.frame.origin.y - 5, 19, 19);
         return;
     }
 
@@ -708,7 +709,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         contentH = MIN(maxH, s.height * 0.8);
     } else {
         NSInteger n = [self panelItems].count + 1;   // + "add" tile
-        CGFloat rowH = 62;
+        CGFloat rowH = 58;
         contentH = headerH + n * rowH + 12;
         contentH = MIN(MAX(contentH, headerH + rowH), maxH);
     }
@@ -774,7 +775,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     CGFloat pad = 10;
     CGFloat tileW = w - pad * 2;
     CGFloat rowGap = 6;
-    CGFloat rowH = 62;
+    CGFloat rowH = 58;
 
     NSInteger total = items.count + 1;
     for (NSInteger i = 0; i < total; i++) {
@@ -2076,7 +2077,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.9.0 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.9.1 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
