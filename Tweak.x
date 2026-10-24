@@ -1343,185 +1343,93 @@ static void sbHome(void) {
 // clamps above zero; and the BLS path was passing state 0, which is UNKNOWN,
 // not "off". BLSBacklightState is Unknown/Active/Inactive/AlwaysOn = 0/1/2/3,
 // so the correct request is 2.
-// 3.2.0 — real screen off, finally.
-//
-// What the logs proved:
-//   * BLSBacklight reports state 2 (already "inactive") both BEFORE and AFTER
-//     the request, so that state is about the backlight service's own notion,
-//     not the physical panel. Driving it changes nothing.
-//   * SBDimScreen / UIScreen.brightness / BLS requests: all report success and
-//     all leave the panel lit.
-//   * SBLockScreenManager / SBUIController / SBLockHardwareButton: none of
-//     those class names exist on 17.3.1 at all.
-//
-// So: enumerate the classes that actually exist and find the real power-key
-// owner, then simulate that key. Enumerated once, logged, then driven.
-static NSArray *SGSleepButtonClasses(void) {
-    static NSArray *cached = nil;
-    if (cached) return cached;
-
-    NSMutableArray *out = [NSMutableArray array];
-    unsigned int count = 0;
-    Class *all = objc_copyClassList(&count);
-    NSMutableString *seen = [NSMutableString string];
-    for (unsigned int i = 0; i < count; i++) {
-        const char *nm = class_getName(all[i]);
-        if (!nm) continue;
-        BOOL hit = strcasestr(nm, "HardwareButton") ||
-                   strcasestr(nm, "PowerButton") ||
-                   strcasestr(nm, "LockButton") ||
-                   strcasestr(nm, "SleepWake");
-        if (!hit) continue;
-        [out addObject:@(nm)];
-        if (seen.length < 1200) [seen appendFormat:@" %s", nm];
-    }
-    if (all) free(all);
-    SGLog(@"sbSleepDisplay: button classes =%@", seen);
-    cached = out;
-    return cached;
-}
-
-static void sbSleepDisplay(void) {
-    SGLog(@"sbSleepDisplay enter");
-
-    NSArray *classes = SGSleepButtonClasses();
-    NSArray *sels = @[ @"performSleepWakeButtonDown",
-                       @"performLockButtonDown",
-                       @"performPowerButtonDown",
-                       @"sleepWakeButtonDown",
-                       @"lockButtonDown",
-                       @"powerButtonDown" ];
-
-    for (NSString *cn in classes) {
-        Class c = NSClassFromString(cn);
-        if (!c) continue;
-
-        // instance (sharedInstance or new) plus the class itself as fallback
-        NSMutableArray *targets = [NSMutableArray array];
-        for (NSString *maker in @[ @"sharedInstance", @"new" ]) {
-            SEL m = NSSelectorFromString(maker);
-            if (![c respondsToSelector:m]) continue;
-            id r = ((id(*)(id, SEL))objc_msgSend)(c, m);
-            if ([maker isEqualToString:@"new"] && r)
-                r = ((id(*)(id, SEL))objc_msgSend)(r, NSSelectorFromString(@"init"));
-            if (r) [targets addObject:r];
-        }
-        [targets addObject:c];
-
-        for (id t in targets) {
-            for (NSString *sn in sels) {
-                SEL sel = NSSelectorFromString(sn);
-                BOOL has = [t respondsToSelector:sel];
-                if (!has && t != c) has = [t respondsToSelector:sel];
-                if (!has) continue;
-                SGLog(@"sbSleepDisplay: calling %@ -%@", cn, sn);
-                @try {
-                    if (t == c)
-                        ((void(*)(id, SEL))objc_msgSend)(c, sel);
-                    else
-                        ((void(*)(id, SEL))objc_msgSend)(t, sel);
-                    SGLog(@"sbSleepDisplay: %@ -%@ returned", cn, sn);
-                    return;
-                } @catch (NSException *e) {
-                    SGLog(@"sbSleepDisplay: %@ -%@ threw %@", cn, sn, e.reason);
-                }
-            }
-        }
-    }
-
-    SGLog(@"sbSleepDisplay: no button class matched");
-}
 
 static void sbLock(void) {
     SGLog(@"sbLock enter");
 
-    // 1) iOS 15-17: the lock screen manager is still the owner of locking.
-    //    -lockUIFromSource:withOptions: is gone on 17; the modern entry points
-    //    are -lockScreenViewController / -lockUIFromSource: and, most reliably,
-    //    -lockDeviceAnimated: on SBLockScreenManager.
-    Class lm = objc_getClass("SBLockScreenManager");
-    if (lm) {
-        id inst = ((id(*)(id, SEL))objc_msgSend)(lm, NSSelectorFromString(@"sharedInstance"));
-        if (inst) {
-            NSString *const sels[] = {
-                @"lockDeviceAnimated:", @"lockUIFromSource:", @"lockScreenViewController"
-            };
-            const char *types[] = { "v@:B", "v@:q", "@@:" };
-            for (int i = 0; i < 3; i++) {
-                SEL sel = NSSelectorFromString(sels[i]);
-                if (![inst respondsToSelector:sel]) continue;
+    // 3.2.2 — the side button, driven the way the button itself does it.
+    //
+    // SBLockHardwareButton is confirmed present on 17.3.1 (it showed up in the
+    // class enumeration). Its sleep/wake handler is the one call that both
+    // locks and blanks the display, so nothing else is needed.
+    //
+    // Deliberately NOT used any more:
+    //   SBLockDevice(port,1)   - succeeded per the log but SpringBoard runs as
+    //                            mobile, so the device did not actually lock
+    //                            and SpringBoard ended up being restarted
+    //                            ("锁屏就注销").
+    //   SBLockScreenManager    - does not exist on 17.3.1.
+    Class btn = NSClassFromString(@"SBLockHardwareButton");
+    SGLog(@"sbLock: SBLockHardwareButton=%@", btn);
+
+    if (btn) {
+        NSMutableArray *targets = [NSMutableArray array];
+        for (NSString *maker in @[ @"sharedInstance", @"new" ]) {
+            SEL m = NSSelectorFromString(maker);
+            if (![btn respondsToSelector:m]) continue;
+            id r = ((id(*)(id, SEL))objc_msgSend)(btn, m);
+            if ([maker isEqualToString:@"new"] && r)
+                r = ((id(*)(id, SEL))objc_msgSend)(r, NSSelectorFromString(@"init"));
+            if (r) {
+                [targets addObject:r];
+                SGLog(@"sbLock: instance via +%@", maker);
+            }
+        }
+
+        static BOOL dumpedLock = NO;
+        if (!dumpedLock) {
+            dumpedLock = YES;
+            unsigned int mc = 0;
+            Method *ms = class_copyMethodList(btn, &mc);
+            NSMutableString *str = [NSMutableString string];
+            for (unsigned int i = 0; i < mc; i++)
+                [str appendFormat:@" %@", NSStringFromSelector(method_getName(ms[i]))];
+            if (ms) free(ms);
+            SGLog(@"sbLock: SBLockHardwareButton methods =%@", str);
+        }
+
+        for (id t in targets) {
+            for (NSString *sn in @[ @"performSleepWakeButtonDown",
+                                    @"performLockButtonDown",
+                                    @"performSingleClickOrLongPress",
+                                    @"lockButtonDown" ]) {
+                SEL sel = NSSelectorFromString(sn);
+                if (![t respondsToSelector:sel]) continue;
+                SGLog(@"sbLock: calling -%@", sn);
                 @try {
-                    if (i == 0) {
-                        ((void(*)(id, SEL, BOOL))objc_msgSend)(inst, sel, YES);
-                    } else if (i == 1) {
-                        ((void(*)(id, SEL, long))objc_msgSend)(inst, sel, 0);
-                    } else {
-                        ((id(*)(id, SEL))objc_msgSend)(inst, sel);
-                    }
-                    SGLog(@"sbLock: SBLockScreenManager %@ OK", sels[i]);
-                    sbSleepDisplay();
+                    ((void(*)(id, SEL))objc_msgSend)(t, sel);
+                    SGLog(@"sbLock: -%@ returned, done", sn);
                     return;
                 } @catch (NSException *e) {
-                    SGLog(@"sbLock: %@ threw %@", sels[i], e.reason);
+                    SGLog(@"sbLock: -%@ threw %@", sn, e.reason);
                 }
             }
-            (void)types;
         }
-        SGLog(@"sbLock: SBLockScreenManager without a usable selector");
     }
 
-    // 2) SBLockDevice via SpringBoardServices (works on <=16)
-    mach_port_t p = gGetPort ? gGetPort() : 0;
-    if (p && gLockDevice) {
-        gLockDevice(p, 1);
-        if (gDimScreen) gDimScreen(p, 1);
-        SGLog(@"sbLock: SBLockDevice OK");
-        sbSleepDisplay();
-        return;
-    }
-
-    // 3) The private SpringBoard "hardware button" path - same thing the
-    //    physical side button triggers, so it works on every iOS version.
-    Class hb = objc_getClass("SBLockHardwareButton");
-    if (!hb) hb = objc_getClass("SBHardwareButtonCoordinator");
-    if (hb) {
+    // Fallback: the interaction object SpringBoard uses for the sleep gesture.
+    Class inter = NSClassFromString(@"SBSleepWakeHardwareButtonInteraction");
+    SGLog(@"sbLock: SBSleepWakeHardwareButtonInteraction=%@", inter);
+    if (inter) {
         id inst = nil;
         SEL sh = NSSelectorFromString(@"sharedInstance");
-        if ([hb respondsToSelector:sh])
-            inst = ((id(*)(id, SEL))objc_msgSend)(hb, sh);
-        if (!inst && [hb respondsToSelector:NSSelectorFromString(@"new")])
-            inst = ((id(*)(id, SEL))objc_msgSend)(hb, NSSelectorFromString(@"new"));
-        for (NSString *n in @[ @"performLockButtonDown", @"lockButtonDown" ]) {
-            SEL sel = NSSelectorFromString(n);
-            if (inst && [inst respondsToSelector:sel]) {
+        if ([inter respondsToSelector:sh])
+            inst = ((id(*)(id, SEL))objc_msgSend)(inter, sh);
+        for (NSString *sn in @[ @"performSleepWakeButtonDown",
+                                @"_performSleepWakeButtonDown" ]) {
+            SEL sel = NSSelectorFromString(sn);
+            if (!inst || ![inst respondsToSelector:sel]) continue;
+            SGLog(@"sbLock: interaction -%@", sn);
+            @try {
                 ((void(*)(id, SEL))objc_msgSend)(inst, sel);
-                SGLog(@"sbLock: %@ -%@ OK", NSStringFromClass(hb), n);
-                sbSleepDisplay();
                 return;
+            } @catch (NSException *e) {
+                SGLog(@"sbLock: interaction -%@ threw %@", sn, e.reason);
             }
         }
     }
 
-    // 4) Last resort: ask the lock screen view controller directly.  On 17 the
-    //    manager hands out a controller whose -activate does the same thing
-    //    the side button does.
-    Class lvc = objc_getClass("SBLockScreenViewController");
-    if (lvc) {
-        SEL sh = NSSelectorFromString(@"sharedInstance");
-        if ([lvc respondsToSelector:sh]) {
-            id inst = ((id(*)(id, SEL))objc_msgSend)(lvc, sh);
-            SEL act = NSSelectorFromString(@"activate");
-            if (inst && [inst respondsToSelector:act]) {
-                ((void(*)(id, SEL))objc_msgSend)(inst, act);
-                SGLog(@"sbLock: SBLockScreenViewController -activate OK");
-                sbSleepDisplay();
-                return;
-            }
-        }
-    }
-
-    SGLog(@"sbLock: all paths failed");
-    sbSleepDisplay();   // at least turn the screen off
+    SGLog(@"sbLock: no path worked - doing nothing rather than respringing");
 }
 
 // 2.1.0: power menu (log out / restart) for the left half of the status bar.
@@ -2211,7 +2119,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.2.0 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.2.2 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
