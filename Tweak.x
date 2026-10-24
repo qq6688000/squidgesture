@@ -1347,77 +1347,74 @@ static void sbHome(void) {
 static void sbLock(void) {
     SGLog(@"sbLock enter");
 
-    // 3.2.3 — what the two method dumps proved:
+    // 3.2.4 — every private class/method guess has failed on 17.3.1:
+    //   SBLockScreenManager       does not exist
+    //   lockDeviceAnimated:       no class in SpringBoard implements it
+    //   SBLockHardwareButton      is a gesture manager, not an executor
+    //   SBLockDevice(port,1)      insufficient privilege -> respring
     //
-    //   SBLockHardwareButton exists, but it is a GESTURE MANAGER: its methods
-    //     are setLongPressGestureRecognizer:, setDoublePressGestureRecognizer:,
-    //     buttonDown:, isButtonDown... There is no perform*ButtonDown on it,
-    //     so driving it cannot lock anything.
-    //   SBSleepWakeHardwareButtonInteraction exists but has no sharedInstance,
-    //     so no instance could be reached.
-    //   SBLockScreenManager does not exist on 17.3.1 at all.
-    //
-    // The lock screen itself is a different object on this version. Find it by
-    // enumerating what is there, then use whatever answers -lockDeviceAnimated:.
-    static NSArray *candidates = nil;
-    if (!candidates) {
-        NSMutableArray *hits = [NSMutableArray array];
-        NSMutableString *seen = [NSMutableString string];
-        unsigned int count = 0;
-        Class *all = objc_copyClassList(&count);
-        for (unsigned int i = 0; i < count; i++) {
-            const char *nm = class_getName(all[i]);
-            if (!nm) continue;
-            if (!strcasestr(nm, "LockScreen") && !strcasestr(nm, "CoverSheet") &&
-                !strcasestr(nm, "LockState")) continue;
-            SEL lockSel = NSSelectorFromString(@"lockDeviceAnimated:");
-            SEL lockSel2 = NSSelectorFromString(@"lockUIFromSource:");
-            BOOL canLock = [all[i] instancesRespondToSelector:lockSel] ||
-                           [all[i] instancesRespondToSelector:lockSel2];
-            if (!canLock) continue;
-            [hits addObject:@(nm)];
-            if (seen.length < 800) [seen appendFormat:@" %s", nm];
-        }
-        if (all) free(all);
-        SGLog(@"sbLock: lockable classes =%@", seen);
-        candidates = hits;
-    }
+    // So stop guessing and use the system's own lock request. Posting
+    // com.apple.springboard.lockcomplete (and the has-locked variant) asks
+    // SpringBoard to lock the device the normal way, which also blanks the
+    // screen because that is what locking does.
+    // com.apple.springboard.lockcomplete / .lockstate are POST-lock
+    // broadcasts - sending them does nothing. The requests devices actually
+    // honour are the "lockbutton"/"hasLocked" pair below.
+    notify_post("com.apple.springboard.lockbutton");
+    notify_post("com.apple.springboard.hasLocked");
+    SGLog(@"sbLock: posted lockbutton + hasLocked");
 
-    for (NSString *cn in candidates) {
-        Class c = NSClassFromString(cn);
-        if (!c) continue;
-        id inst = nil;
-        for (NSString *maker in @[ @"sharedInstance", @"new" ]) {
-            SEL m = NSSelectorFromString(maker);
-            if (![c respondsToSelector:m]) continue;
-            id r = ((id(*)(id, SEL))objc_msgSend)(c, m);
-            if ([maker isEqualToString:@"new"] && r)
-                r = ((id(*)(id, SEL))objc_msgSend)(r, NSSelectorFromString(@"init"));
-            if (r) { inst = r; break; }
-        }
-        if (!inst) { SGLog(@"sbLock: %@ - no instance", cn); continue; }
+    // Belt and braces: also try the private "has locked" centre used by
+    // CredentialKit-era builds, then verify after a short delay.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+      BOOL locked = NO;
+      @try {
+          Class lm = NSClassFromString(@"SBLockScreenManager");
+          if (!lm) lm = NSClassFromString(@"SBLockStateAggregator");
+          if (lm) {
+              id inst = nil;
+              SEL sh = NSSelectorFromString(@"sharedInstance");
+              if ([lm respondsToSelector:sh])
+                  inst = ((id(*)(id, SEL))objc_msgSend)(lm, sh);
+              for (NSString *sn in @[ @"isLocked", @"isLockedOrDimming" ]) {
+                  SEL sel = NSSelectorFromString(sn);
+                  if (inst && [inst respondsToSelector:sel]) {
+                      locked = ((BOOL(*)(id, SEL))objc_msgSend)(inst, sel);
+                      SGLog(@"sbLock: %@ -%@ = %d", NSStringFromClass(lm), sn, locked);
+                      break;
+                  }
+              }
+          }
+      } @catch (__unused NSException *e) { }
 
-        SEL a = NSSelectorFromString(@"lockDeviceAnimated:");
-        SEL b = NSSelectorFromString(@"lockUIFromSource:");
-        @try {
-            if ([inst respondsToSelector:a]) {
-                SGLog(@"sbLock: %@ -lockDeviceAnimated:YES", cn);
-                ((void(*)(id, SEL, BOOL))objc_msgSend)(inst, a, YES);
-                SGLog(@"sbLock: locked via %@", cn);
-                return;
-            }
-            if ([inst respondsToSelector:b]) {
-                SGLog(@"sbLock: %@ -lockUIFromSource:0", cn);
-                ((void(*)(id, SEL, int64_t))objc_msgSend)(inst, b, 0);
-                SGLog(@"sbLock: locked via %@", cn);
-                return;
-            }
-        } @catch (NSException *e) {
-            SGLog(@"sbLock: %@ threw %@", cn, e.reason);
-        }
-    }
-
-    SGLog(@"sbLock: no lockable class found");
+      if (!locked) {
+          SGLog(@"sbLock: still unlocked, trying SBDeviceLockStateMonitor");
+          // Last resort: the lock screen view controller, presented directly.
+          Class lvc = NSClassFromString(@"SBLockScreenViewController");
+          if (!lvc) lvc = NSClassFromString(@"CSCoverSheetViewController");
+          if (lvc) {
+              id inst = nil;
+              SEL sh = NSSelectorFromString(@"sharedInstance");
+              if ([lvc respondsToSelector:sh])
+                  inst = ((id(*)(id, SEL))objc_msgSend)(lvc, sh);
+              for (NSString *sn in @[ @"lockDeviceAnimated:", @"activate", @"lockNow" ]) {
+                  SEL sel = NSSelectorFromString(sn);
+                  if (!inst || ![inst respondsToSelector:sel]) continue;
+                  @try {
+                      if ([sn hasSuffix:@":"])
+                          ((void(*)(id, SEL, BOOL))objc_msgSend)(inst, sel, YES);
+                      else
+                          ((void(*)(id, SEL))objc_msgSend)(inst, sel);
+                      SGLog(@"sbLock: %@ -%@", NSStringFromClass(lvc), sn);
+                      break;
+                  } @catch (NSException *e) {
+                      SGLog(@"sbLock: -%@ threw %@", sn, e.reason);
+                  }
+              }
+          }
+      }
+    });
 }
 
 // 2.1.0: power menu (log out / restart) for the left half of the status bar.
@@ -2107,7 +2104,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.2.3 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.2.4 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
