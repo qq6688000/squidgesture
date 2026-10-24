@@ -32,6 +32,13 @@ static BOOL gRightEdgeSwitcher = YES;
 static BOOL gCornerTapLock = YES;
 static BOOL gCornerTapPower = YES;      // 2.1.0: left top-bar double tap
 static BOOL gTwoFingerScreenshot = YES; // 2.1.0: two-finger swipe down
+// 3.5.1 — how far the two-finger CENTROID must travel before the screenshot
+// fires. Firing on touch-down was far too eager: pinch-to-zoom, rotate and
+// plain two-finger taps all triggered it. The centroid is the right measure
+// because pinch and rotate barely move it - the fingers travel in opposite
+// directions - so they stop registering, while a real two-finger swipe
+// moves it by exactly the finger travel.
+static CGFloat gTwoFingerTravel = 30.0;
 static BOOL gCornerTapScreenshot = YES;
 static BOOL gThreeFingerHome = YES;
 static BOOL gThreeFingerSwitcher = YES;
@@ -101,6 +108,8 @@ static void loadPrefs(void) {
     if (p[@"PanelPrewarmLimit"]) gPanelPrewarmLimit = [p[@"PanelPrewarmLimit"] integerValue];
     if (p[@"PanelBarTolerance"]) gPanelBarTolerance = [p[@"PanelBarTolerance"] floatValue];
     if (p[@"PanelBarWidth"]) gPanelBarWidth = [p[@"PanelBarWidth"] floatValue];
+    if (p[@"TwoFingerTravel"]) gTwoFingerTravel = [p[@"TwoFingerTravel"] floatValue];
+    if (gTwoFingerTravel < 0) gTwoFingerTravel = 0;
 
     NSArray *list = p[@"PanelApps"];
     if (!list) list = @[ @"com.apple.MobileSMS", @"com.apple.mobilesafari",
@@ -1896,33 +1905,54 @@ static char kAttachedKey;
 }
 @end
 
-// 3.5.0 — two-finger ANY gesture -> screenshot.
+// 3.5.1 — two-finger ANY gesture -> screenshot, but only once the gesture is
+// actually a gesture.
 //
-// Previously this was a UISwipeGestureRecognizer limited to swipe-down, so
-// two fingers had to travel in one specific direction. UISwipeGestureRecognizer
-// cannot express "any direction" - it takes a single direction mask and spaces
-// is a bitmask of allowed directions that still all have to be monotonic swipes.
+// 3.5.0 fired the instant a second finger landed. That made every two-finger
+// interaction take a screenshot: pinch-to-zoom, rotate, a two-finger tap.
+// Far too eager.
 //
-// A UIGestureRecognizer subclass that fires the moment a second finger lands
-// covers every two-finger gesture at once: pinch, rotate, swipe in any
-// direction, or just two fingers tapping. Nothing needs to move first.
+// The fix measures the CENTROID of the two touches, not either finger. Pinch
+// and rotate move the fingers in opposite directions, so the centroid barely
+// shifts and they stop triggering. A real two-finger swipe drags the centroid
+// by exactly the finger travel, so it still triggers reliably - in any
+// direction, which is the whole point.
 @interface SGTwoFingerRecognizer : UIGestureRecognizer
+@property (nonatomic, assign) CGPoint startCentroid;
+@property (nonatomic, assign) BOOL hasStart;
 @end
 
 @implementation SGTwoFingerRecognizer
 
+- (void)reset {
+    [super reset];
+    self.hasStart = NO;
+    self.startCentroid = CGPointZero;
+}
+
+// Mean position of every touch currently on the surface.
+- (CGPoint)centroidOf:(NSSet<UITouch *> *)touches {
+    CGFloat x = 0, y = 0;
+    NSUInteger n = 0;
+    for (UITouch *t in touches) {
+        CGPoint p = [t locationInView:nil];
+        x += p.x; y += p.y; n++;
+    }
+    if (!n) return CGPointZero;
+    return CGPointMake(x / n, y / n);
+}
+
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    // allTouches holds every finger currently on the screen, including ones
-    // that landed in an earlier callback. So the count hits exactly 2 on the
-    // frame the second finger arrives - that is the trigger.
     NSUInteger n = event.allTouches.count;
 
     if (n == 2 && self.state == UIGestureRecognizerStatePossible) {
-        self.state = UIGestureRecognizerStateRecognized;
+        // Anchor the measurement. Nothing fires yet - we wait for travel.
+        self.startCentroid = [self centroidOf:event.allTouches];
+        self.hasStart = YES;
         return;
     }
     if (n > 2) {
-        // Three fingers is the three-finger gestures' business, not ours.
+        // Three fingers belong to the three-finger gestures.
         self.state = UIGestureRecognizerStateFailed;
         return;
     }
@@ -1930,10 +1960,23 @@ static char kAttachedKey;
 }
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    // Recognised on touch-down, so nothing to do; keep the state intact.
+    if (!self.hasStart || self.state != UIGestureRecognizerStatePossible) return;
+    if (event.allTouches.count != 2) return;
+
+    CGPoint c = [self centroidOf:event.allTouches];
+    CGFloat dx = c.x - self.startCentroid.x;
+    CGFloat dy = c.y - self.startCentroid.y;
+    CGFloat dist = sqrt(dx * dx + dy * dy);
+
+    if (dist >= gTwoFingerTravel) {
+        // Travel threshold crossed: this is a real swipe, in whatever
+        // direction the user chose.
+        self.state = UIGestureRecognizerStateRecognized;
+    }
 }
 
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    // Lifting off without ever travelling = a two-finger tap, not a swipe.
     if (self.state == UIGestureRecognizerStatePossible)
         self.state = UIGestureRecognizerStateFailed;
 }
@@ -1943,7 +1986,7 @@ static char kAttachedKey;
         self.state = UIGestureRecognizerStateFailed;
 }
 
-// Never block the app's own gestures: a two-finger pinch must still zoom.
+// Never block the app's own gestures: pinch-to-zoom must still work.
 - (BOOL)canPreventGestureRecognizer:(UIGestureRecognizer *)other { return NO; }
 - (BOOL)canBePreventedByGestureRecognizer:(UIGestureRecognizer *)other { return NO; }
 
@@ -2178,6 +2221,18 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 
 - (void)onTwoFingerDown:(UIGestureRecognizer *)g {
     if (!gEnabled || !gTwoFingerScreenshot) return;
+    if (g.state != UIGestureRecognizerStateRecognized) return;
+
+    // 3.5.1: cooldown. A swipe can re-anchor and cross the threshold again
+    // before the fingers lift, which would fire the shutter twice.
+    static NSTimeInterval last = 0;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - last < 1.0) {
+        SGLog(@"twoFingerAny -> skipped (cooldown)");
+        return;
+    }
+    last = now;
+
     SGLog(@"twoFingerAny -> screenshot");
     doScreenshot();
 }
@@ -2246,7 +2301,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.5.0 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.5.1 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
