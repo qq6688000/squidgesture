@@ -151,6 +151,19 @@ static SuspendFunc gSuspendFrontmost = NULL;
 static LockFunc gLockDevice = NULL;
 static DimFunc gDimScreen = NULL;
 
+// The one piece that was always missing.
+//
+// SBLockDevice(port, 1) only tells SpringBoard to *lock*. It never touches
+// the backlight — that lives in backboardd, a different daemon reached over
+// BKSDisplayServicesServerPort. That is why the device locked while the
+// screen stayed lit, every single time.
+//
+// These two live in BackBoardServices and are plain Mach messages to
+// backboardd. SetScreenBlanked(1) is literally "turn the panel off".
+typedef void (*BlankFunc)(int);
+static BlankFunc gBlankScreen = NULL;
+static BlankFunc gBlankDisplay = NULL;
+
 static void initSBS(void) {
     void *h = dlopen(
         "/System/Library/PrivateFrameworks/SpringBoardServices.framework/"
@@ -161,8 +174,19 @@ static void initSBS(void) {
     // Apple's own MDM (DMDLockUtilities) does: SBLockDevice(port, 1)
     gLockDevice     = (LockFunc)dlsym(h, "SBLockDevice");
     gDimScreen      = (DimFunc)dlsym(h, "SBDimScreen");
-    SGLog(@"SBS symbols port=%p suspend=%p lock=%p dim=%p",
-          gGetPort, gSuspendFrontmost, gLockDevice, gDimScreen);
+
+    void *bks = dlopen(
+        "/System/Library/PrivateFrameworks/BackBoardServices.framework/"
+        "BackBoardServices", RTLD_LAZY);
+    if (bks) {
+        gBlankScreen  = (BlankFunc)dlsym(bks, "BKSDisplayServicesSetScreenBlanked");
+        gBlankDisplay = (BlankFunc)dlsym(bks, "BKSDisplayServicesSetDisplayBlanked");
+    }
+
+    SGLog(@"SBS symbols port=%p suspend=%p lock=%p dim=%p", gGetPort,
+          gSuspendFrontmost, gLockDevice, gDimScreen);
+    SGLog(@"BKS blank screen=%p display=%p bks=%p", gBlankScreen,
+          gBlankDisplay, bks);
 }
 
 #pragma mark - Darwin actions
@@ -181,6 +205,10 @@ static void initSBS(void) {
 // Emergency escape hatch - force-close the panel from a shell:
 //   notify_post com.minis.squidgesture.test.hide
 #define kNotifyHide     "com.minis.squidgesture.test.hide"
+// 3.4.0: escape hatch. If blanking ever leaves the panel dark, run
+//   notify_post com.minis.squidgesture.test.unblank
+// from a shell and the screen comes back without a reboot.
+#define kNotifyUnblank  "com.minis.squidgesture.test.unblank"
 
 // 2.9.2: all haptic feedback removed at the user's request. Kept as no-op
 // functions so every existing call site stays valid.
@@ -1356,25 +1384,59 @@ static void sbHome(void) {
 //
 // SBLockDevice already handles BOTH locking AND screen-off (that is what
 // locking does), so no separate sleep call is needed. Just call it and stop.
+// Undo a blank. Safe to call at any time; blanked=0 is a no-op when the
+// panel is already on.
+static void sbUnblank(void) {
+    @try {
+        if (gBlankScreen)  { gBlankScreen(0);  SGLog(@"sbUnblank: screen 0"); }
+        if (gBlankDisplay) { gBlankDisplay(0); SGLog(@"sbUnblank: display 0"); }
+    } @catch (NSException *e) {
+        SGLog(@"sbUnblank threw %@", e.reason);
+    }
+}
+
 static void sbLock(void) {
     SGLog(@"sbLock enter");
 
     mach_port_t p = gGetPort ? gGetPort() : 0;
-    SGLog(@"sbLock: port=%u lockDevice=%p", p, gLockDevice);
+    SGLog(@"sbLock: port=%u lock=%p blankScreen=%p blankDisplay=%p", p,
+          gLockDevice, gBlankScreen, gBlankDisplay);
 
+    // Step 1 — lock the device. This is Apple's own call (DMDLockUtilities).
+    // It locks, but it does NOT turn the panel off; it only moves the UI to
+    // the lock screen. Screen-off is backboardd's job.
     if (p && gLockDevice) {
         @try {
             gLockDevice(p, 1);
-            SGLog(@"sbLock: SBLockDevice(port, 1) done");
-            // Do NOT call sbSleepDisplay or any BLS code here.
-            // The system turns the screen off as part of locking.
-            return;
+            SGLog(@"sbLock: SBLockDevice done");
         } @catch (NSException *e) {
             SGLog(@"sbLock: SBLockDevice threw %@", e.reason);
         }
     }
 
-    SGLog(@"sbLock: SBLockDevice unavailable, nothing else tried");
+    // Step 2 — blank the panel, which is what "熄屏" actually means.
+    // These talk straight to backboardd over BKSDisplayServicesServerPort,
+    // bypassing SpringBoard entirely. Give SpringBoard a moment to move to
+    // the lock screen first so we blank the lock screen, not the last frame
+    // of the app that was in front.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try {
+            if (gBlankScreen) {
+                gBlankScreen(1);
+                SGLog(@"sbLock: SetScreenBlanked(1) sent");
+            }
+            if (gBlankDisplay) {
+                gBlankDisplay(1);
+                SGLog(@"sbLock: SetDisplayBlanked(1) sent");
+            }
+            if (!gBlankScreen && !gBlankDisplay) {
+                SGLog(@"sbLock: no blanking symbol available");
+            }
+        } @catch (NSException *e) {
+            SGLog(@"sbLock: blanking threw %@", e.reason);
+        }
+    });
 }
 
 // 2.1.0: power menu (log out / restart) for the left half of the status bar.
@@ -1525,6 +1587,8 @@ static void actionNotifyCb(CFNotificationCenterRef c, void *o, CFStringRef n,
             vibrate(); sbPowerMenu();
         } else if (CFStringCompare(n, CFSTR(kNotifyShot), 0) == kCFCompareEqualTo) {
             doScreenshot();
+        } else if (CFStringCompare(n, CFSTR(kNotifyUnblank), 0) == kCFCompareEqualTo) {
+            sbUnblank();
         } else if (CFStringCompare(n, CFSTR(kNotifyHide), 0) == kCFCompareEqualTo) {
             SGLog(@"force hide received");
             SGLauncherHide();
@@ -2064,7 +2128,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.3.1 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.4.0 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
@@ -2105,6 +2169,9 @@ static void attachAllWindows(void) {
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
             CFSTR(kNotifyHide), NULL, CFNotificationSuspensionBehaviorCoalesce);
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(), NULL, actionNotifyCb,
+            CFSTR(kNotifyUnblank), NULL, CFNotificationSuspensionBehaviorCoalesce);
     }
 
     // Attach immediately + polled re-attach (covers windows created later,
