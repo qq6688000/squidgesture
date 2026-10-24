@@ -355,13 +355,34 @@ static void SGPrewarmPanelApps(void) {
 // animation, so 0.5 makes system transitions run at double speed. Applied only
 // around a panel-triggered launch, then restored.
 static void SGSetAnimationSpeed(CGFloat coefficient) {
+    // UIKit reads the drag coefficient from a global symbol
+    // (_UIAnimationDragCoefficient) rather than from UIView, so poke both.
+    void *h = dlopen("/System/Library/PrivateFrameworks/UIKitCore.framework/UIKitCore",
+                     RTLD_LAZY);
+    if (h) {
+        float *(*getter)(void) = (float *(*)(void))dlsym(h, "_UIAnimationDragCoefficient");
+        if (getter) {
+            float *slot = getter();
+            if (slot) {
+                *slot = (float)coefficient;
+                SGLog(@"anim speed: global=%.2f", (double)*slot);
+            } else {
+                SGLog(@"anim speed: global slot null");
+            }
+        } else {
+            SGLog(@"anim speed: symbol not found");
+        }
+    }
+
     Class ui = objc_getClass("UIView");
-    if (!ui) return;
-    SEL sel = NSSelectorFromString(@"_setAnimationDragCoefficient:");
-    if (![ui respondsToSelector:sel]) return;
-    @try {
-        ((void(*)(id, SEL, float))objc_msgSend)(ui, sel, (float)coefficient);
-    } @catch (__unused NSException *e) { }
+    if (ui) {
+        SEL sel = NSSelectorFromString(@"_setAnimationDragCoefficient:");
+        if ([ui respondsToSelector:sel]) {
+            @try {
+                ((void(*)(id, SEL, float))objc_msgSend)(ui, sel, (float)coefficient);
+            } @catch (__unused NSException *e) { }
+        }
+    }
 }
 
 static BOOL SGLaunchApp(NSString *bundleID) {
@@ -870,7 +891,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
                                      ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0);
                                dispatch_after(
                                    dispatch_time(DISPATCH_TIME_NOW,
-                                                 (int64_t)(0.6 * NSEC_PER_SEC)),
+                                                 (int64_t)(1.2 * NSEC_PER_SEC)),
                                    dispatch_get_main_queue(), ^{
                                      SGSetAnimationSpeed(1.0);
                                      SGLog(@"launch: animation speed restored");
@@ -2283,7 +2304,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.0.0 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.0.1 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
