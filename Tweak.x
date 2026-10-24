@@ -1622,12 +1622,18 @@ static void doScreenshot(void) {
     vibrate();
     SGLog(@"doScreenshot enter isSpringBoard=%d", isSpringBoard());
 
-    // 2.5.0
-    // - CARenderServerRenderDisplay: arity differs per iOS, 4-arg call onto a
-    //   5-arg build corrupts the stack -> safe mode. Never again.
-    // - IOHIDEventSystemClient: the class is only registered once IOKit is
-    //   loaded, so objc_getClass returned nil ("IOKit classes missing").
-    //   Load the framework first, then use the plain C entry points.
+    // 2.5.1 — why the previous attempts crashed:
+    //
+    //  * CARenderServerRenderDisplay: 4-arg call into a 5-arg function.
+    //  * IOHIDEventCreateKeyboardEvent: declared with 5 args, the real one
+    //    takes 7, AND I cast the 64-bit client pointer down to uint32_t when
+    //    dispatching. Either is enough to smash the stack / deref garbage.
+    //
+    // Raw C function pointers are simply too fragile here: every one of these
+    // private symbols has an undocumented arity that differs per iOS build.
+    // Objective-C message sends do not care about arity, so the whole thing is
+    // done through objc_msgSend with respondsToSelector guards instead. That
+    // cannot corrupt the stack no matter what the real prototype is.
     if (!isSpringBoard()) {
         notify_post(kNotifyShot);
         return;
@@ -1635,83 +1641,60 @@ static void doScreenshot(void) {
 
     dispatch_async(dispatch_get_main_queue(), ^{
       @try {
+        // IOKit must be loaded before its classes are registered.
         void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",
                              RTLD_NOW);
         if (!iokit) iokit = dlopen("/usr/lib/libIOKit.dylib", RTLD_NOW);
-        if (!iokit) {
-            SGLog(@"doScreenshot: IOKit dlopen failed (%s)", dlerror());
-            return;
+        SGLog(@"doScreenshot: iokit=%p", iokit);
+
+        Class cliCls = NSClassFromString(@"IOHIDEventSystemClient");
+        Class evCls  = NSClassFromString(@"IOHIDEvent");
+        SGLog(@"doScreenshot: client=%@ event=%@", cliCls, evCls);
+        if (!cliCls || !evCls) { SGLog(@"doScreenshot: classes missing"); return; }
+
+        id client = nil;
+        for (NSString *n in @[ @"sharedInstance", @"create" ]) {
+            SEL sel = NSSelectorFromString(n);
+            if (![cliCls respondsToSelector:sel]) continue;
+            client = ((id(*)(id, SEL))objc_msgSend)(cliCls, sel);
+            if (client) { SGLog(@"doScreenshot: client via +%@", n); break; }
         }
+        if (!client) { SGLog(@"doScreenshot: no client"); return; }
 
-        // The public C API: create a client, build an event, dispatch it.
-        typedef void *(*CreateFn)(CFAllocatorRef);
-        typedef void *(*EventCreateFn)(CFAllocatorRef, uint32_t, uint32_t, uint32_t, int64_t);
-        typedef void (*DispatchFn)(uint32_t, void *);
+        // Pick whichever event factory and dispatch selector actually exist.
+        NSArray *factories = @[ @"keyboardEvent:", @"keyboardEvent:options:" ];
+        NSString *factory = nil;
+        for (NSString *f in factories)
+            if ([evCls respondsToSelector:NSSelectorFromString(f)]) { factory = f; break; }
+        NSArray *senders = @[ @"dispatchEvent:toDispatcher:", @"dispatchEvent:" ];
+        NSString *sender = nil;
+        for (NSString *d in senders)
+            if ([client respondsToSelector:NSSelectorFromString(d)]) { sender = d; break; }
 
-        CreateFn create = (CreateFn)dlsym(iokit, "IOHIDEventSystemClientCreate");
-        EventCreateFn evCreate =
-            (EventCreateFn)dlsym(iokit, "IOHIDEventCreateKeyboardEvent");
-        DispatchFn dispatch =
-            (DispatchFn)dlsym(iokit, "IOHIDEventSystemClientDispatchEvent");
+        SGLog(@"doScreenshot: factory=%@ sender=%@", factory, sender);
+        if (!factory || !sender) { SGLog(@"doScreenshot: no usable selectors"); return; }
 
-        SGLog(@"doScreenshot: create=%p evCreate=%p dispatch=%p",
-              create, evCreate, dispatch);
-
-        // Fall back to the Objective-C client if any C symbol is missing:
-        // the class only exists once IOKit is loaded, which is now the case.
-        if (!create || !evCreate || !dispatch) {
-            SGLog(@"doScreenshot: C API incomplete, trying ObjC client");
-            Class cliCls = NSClassFromString(@"IOHIDEventSystemClient");
-            Class evCls  = NSClassFromString(@"IOHIDEvent");
-            SGLog(@"doScreenshot: classes client=%@ event=%@", cliCls, evCls);
-            if (!cliCls || !evCls) { SGLog(@"doScreenshot: ObjC classes missing"); return; }
-
-            id client = nil;
-            for (NSString *n in @[ @"sharedInstance", @"create" ]) {
-                SEL sel = NSSelectorFromString(n);
-                if ([cliCls respondsToSelector:sel]) {
-                    client = ((id(*)(id, SEL))objc_msgSend)(cliCls, sel);
-                    if (client) { SGLog(@"doScreenshot: client via %@", n); break; }
-                }
-            }
-            if (!client) { SGLog(@"doScreenshot: no client"); return; }
-
-            SEL mk = NSSelectorFromString(@"keyboardEvent:");
-            SEL dsp = NSSelectorFromString(@"dispatchEvent:toDispatcher:");
-            if (![evCls respondsToSelector:mk] || ![client respondsToSelector:dsp]) {
-                SGLog(@"doScreenshot: ObjC selectors missing");
-                return;
-            }
-            __block int n = 0;
-            void (^sendObjC)(uint32_t, BOOL) = ^(uint32_t usage, BOOL down) {
-                id ev = ((id(*)(id, SEL, uint32_t))objc_msgSend)(evCls, mk, usage);
-                if (!ev) return;
-                SEL setV = NSSelectorFromString(@"setIntegerValue:");
-                if ([ev respondsToSelector:setV])
-                    ((void(*)(id, SEL, int64_t))objc_msgSend)(ev, setV, down ? 1 : 0);
-                ((void(*)(id, SEL, id, id))objc_msgSend)(client, dsp, ev, nil);
-                n++;
-            };
-            sendObjC(0x30, YES);
-            sendObjC(0xE9, YES);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-              sendObjC(0xE9, NO);
-              sendObjC(0x30, NO);
-              SGLog(@"doScreenshot: ObjC combo dispatched (%d)", n);
-            });
-            return;
-        }
-
-        void *client = create(kCFAllocatorDefault);
-        if (!client) { SGLog(@"doScreenshot: no HID client"); return; }
-
-        // usage page 0x0C (consumer): 0x30 = side/power, 0xE9 = volume up.
+        // usage page 0x0C (consumer): 0x30 = side button, 0xE9 = volume up.
+        __block int sent = 0;
         void (^send)(uint32_t, BOOL) = ^(uint32_t usage, BOOL down) {
-            void *ev = evCreate(kCFAllocatorDefault, 0, 0, usage, down ? 1 : 0);
-            if (!ev) { SGLog(@"doScreenshot: event nil 0x%x", usage); return; }
-            dispatch((uint32_t)(uintptr_t)client, ev);
-            CFRelease((CFTypeRef)ev);
+            id ev = nil;
+            if ([factory hasSuffix:@"options:"])
+                ev = ((id(*)(id, SEL, uint32_t, uint64_t))objc_msgSend)(
+                        evCls, NSSelectorFromString(factory), usage, 0);
+            else
+                ev = ((id(*)(id, SEL, uint32_t))objc_msgSend)(
+                        evCls, NSSelectorFromString(factory), usage);
+            if (!ev) { SGLog(@"doScreenshot: nil event 0x%x", usage); return; }
+
+            SEL setV = NSSelectorFromString(@"setIntegerValue:");
+            if ([ev respondsToSelector:setV])
+                ((void(*)(id, SEL, int64_t))objc_msgSend)(ev, setV, down ? 1 : 0);
+
+            if ([sender isEqualToString:@"dispatchEvent:"])
+                ((void(*)(id, SEL, id))objc_msgSend)(client, NSSelectorFromString(sender), ev);
+            else
+                ((void(*)(id, SEL, id, id))objc_msgSend)(client, NSSelectorFromString(sender), ev, nil);
+            sent++;
         };
 
         send(0x30, YES);
@@ -1720,7 +1703,7 @@ static void doScreenshot(void) {
                        dispatch_get_main_queue(), ^{
           send(0xE9, NO);
           send(0x30, NO);
-          SGLog(@"doScreenshot: combo dispatched");
+          SGLog(@"doScreenshot: combo dispatched (%d)", sent);
         });
       } @catch (NSException *e) {
           // A screenshot must never be able to take SpringBoard down.
@@ -2005,7 +1988,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.5.0 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.5.1 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
