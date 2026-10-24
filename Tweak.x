@@ -1384,59 +1384,87 @@ static void sbHome(void) {
 //
 // SBLockDevice already handles BOTH locking AND screen-off (that is what
 // locking does), so no separate sleep call is needed. Just call it and stop.
-// Undo a blank. Safe to call at any time; blanked=0 is a no-op when the
-// panel is already on.
-static void sbUnblank(void) {
-    @try {
-        if (gBlankScreen)  { gBlankScreen(0);  SGLog(@"sbUnblank: screen 0"); }
-        if (gBlankDisplay) { gBlankDisplay(0); SGLog(@"sbUnblank: display 0"); }
-    } @catch (NSException *e) {
-        SGLog(@"sbUnblank threw %@", e.reason);
-    }
+// 3.4.1 — the blanking call DID work (screen went dark for ~1s) and then
+// SpringBoard crashed. That is a state mismatch, not a bad symbol: we turned
+// the panel off behind SpringBoard's back, so its backlight bookkeeping
+// disagreed with reality and it died.
+//
+// Blanking alone is therefore not a viable route. Removed entirely.
+//
+// The right way is to make the *system* sleep, the same way the side button
+// does. Everything below is a read-only probe: it enumerates the real method
+// signatures so the next build can call the correct one instead of guessing
+// (guessing is what produced the FBS and BLS crashes earlier).
+
+static void sgDumpClass(const char *name) {
+    Class c = objc_getClass(name);
+    if (!c) { SGLog(@"  [%@] ABSENT", @(name)); return; }
+    SGLog(@"  [%@] present super=%@", @(name), NSStringFromClass(class_getSuperclass(c)));
+
+    unsigned int n = 0;
+    Method *cm = class_copyMethodList(object_getClass(c), &n);
+    NSMutableString *s = [NSMutableString string];
+    for (unsigned int i = 0; i < n && i < 24; i++)
+        [s appendFormat:@" +%s", sel_getName(method_getName(cm[i]))];
+    free(cm);
+    if (s.length) SGLog(@"     class methods:%@", s);
+
+    n = 0;
+    Method *im = class_copyMethodList(c, &n);
+    [s setString:@""];
+    for (unsigned int i = 0; i < n && i < 40; i++)
+        [s appendFormat:@" -%s", sel_getName(method_getName(im[i]))];
+    free(im);
+    if (s.length) SGLog(@"     instance methods:%@", s);
 }
+
+static void sbSleepProbe(void) {
+    SGLog(@"=== sleep probe start ===");
+
+    // Which classes actually exist on this OS build?
+    static const char *names[] = {
+        "SBLockHardwareButton", "SBSleepWakeHardwareButtonInteraction",
+        "BLSBacklight", "BLSBacklightChangeRequest", "BLSBacklightChangeEvent",
+        "SBScreenSleepCoordinator", "SBBacklightController",
+        "SBLockScreenService", "SBSLockScreenService",
+        "SBIdleTimerGlobalCoordinator", "SBIdleTimerAggregateSource",
+        "SBScreenWakeAnimationController", "SBHardwareButtonController",
+        NULL
+    };
+    for (int i = 0; names[i]; i++) sgDumpClass(names[i]);
+
+    // Is something holding the device awake? Playing audio (e.g. a keep-alive
+    // tweak) suppresses the normal lock -> screen-off transition, which would
+    // explain why locking never turned the panel off on its own.
+    Class app = objc_getClass("UIApplication");
+    if (app && [app respondsToSelector:@selector(sharedApplication)]) {
+        id a = ((id(*)(id,SEL))objc_msgSend)(app, @selector(sharedApplication));
+        if (a && [a respondsToSelector:@selector(isIdleTimerDisabled)])
+            SGLog(@"idleTimerDisabled=%d",
+                  ((BOOL(*)(id,SEL))objc_msgSend)(a, @selector(isIdleTimerDisabled)));
+        if (a && [a respondsToSelector:@selector(applicationState)])
+            SGLog(@"applicationState=%ld",
+                  (long)((NSInteger(*)(id,SEL))objc_msgSend)(a, @selector(applicationState)));
+    }
+    SGLog(@"=== sleep probe end ===");
+}
+
+// Lock only. This is the behaviour that never crashed.
+static void sbUnblank(void) { }
 
 static void sbLock(void) {
     SGLog(@"sbLock enter");
-
     mach_port_t p = gGetPort ? gGetPort() : 0;
-    SGLog(@"sbLock: port=%u lock=%p blankScreen=%p blankDisplay=%p", p,
-          gLockDevice, gBlankScreen, gBlankDisplay);
-
-    // Step 1 — lock the device. This is Apple's own call (DMDLockUtilities).
-    // It locks, but it does NOT turn the panel off; it only moves the UI to
-    // the lock screen. Screen-off is backboardd's job.
+    SGLog(@"sbLock: port=%u lock=%p", p, gLockDevice);
     if (p && gLockDevice) {
         @try {
             gLockDevice(p, 1);
             SGLog(@"sbLock: SBLockDevice done");
         } @catch (NSException *e) {
-            SGLog(@"sbLock: SBLockDevice threw %@", e.reason);
+            SGLog(@"sbLock: threw %@", e.reason);
         }
     }
-
-    // Step 2 — blank the panel, which is what "熄屏" actually means.
-    // These talk straight to backboardd over BKSDisplayServicesServerPort,
-    // bypassing SpringBoard entirely. Give SpringBoard a moment to move to
-    // the lock screen first so we blank the lock screen, not the last frame
-    // of the app that was in front.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        @try {
-            if (gBlankScreen) {
-                gBlankScreen(1);
-                SGLog(@"sbLock: SetScreenBlanked(1) sent");
-            }
-            if (gBlankDisplay) {
-                gBlankDisplay(1);
-                SGLog(@"sbLock: SetDisplayBlanked(1) sent");
-            }
-            if (!gBlankScreen && !gBlankDisplay) {
-                SGLog(@"sbLock: no blanking symbol available");
-            }
-        } @catch (NSException *e) {
-            SGLog(@"sbLock: blanking threw %@", e.reason);
-        }
-    });
+    sbSleepProbe();
 }
 
 // 2.1.0: power menu (log out / restart) for the left half of the status bar.
@@ -2128,7 +2156,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.4.0 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.4.1 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
