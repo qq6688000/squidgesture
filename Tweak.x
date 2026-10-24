@@ -498,6 +498,8 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
 @property (nonatomic, strong) UILabel *nameLabel;
 @property (nonatomic, strong) UIButton *removeBtn;
 @property (nonatomic, assign) BOOL addTile;
+// 2.9.0: icon on the left, label on the right (one-row layout).
+@property (nonatomic, assign) BOOL vertical;
 @end
 
 @implementation SGTile
@@ -539,9 +541,27 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGFloat w = self.bounds.size.width;
+    CGFloat h = self.bounds.size.height;
+
+    if (_vertical) {
+        // one row: 40pt icon on the left, label filling the rest
+        CGFloat iconSize = 40.0;
+        CGFloat left = 8.0;
+        _iconView.frame = CGRectMake(left, (h - iconSize) / 2.0, iconSize, iconSize);
+        _iconView.layer.cornerRadius = iconSize * 0.225;
+        CGFloat textX = left + iconSize + 9.0;
+        _nameLabel.textAlignment = NSTextAlignmentLeft;
+        _nameLabel.font = [UIFont systemFontOfSize:12.5];
+        _nameLabel.frame = CGRectMake(textX, (h - 16) / 2.0, w - textX - 8, 16);
+        _removeBtn.frame = CGRectMake(left - 4, (h - iconSize) / 2.0 - 7, 20, 20);
+        return;
+    }
+
     CGFloat iconSize = MIN(w - 6, 60.0);
     _iconView.frame = CGRectMake((w - iconSize) / 2, 0, iconSize, iconSize);
     _iconView.layer.cornerRadius = iconSize * 0.225;
+    _nameLabel.textAlignment = NSTextAlignmentCenter;
+    _nameLabel.font = [UIFont systemFontOfSize:10.5];
     _nameLabel.frame = CGRectMake(-4, iconSize + 5, w + 8, 13);
     _removeBtn.frame = CGRectMake(_iconView.frame.origin.x - 6, -6, 22, 22);
 }
@@ -676,38 +696,42 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     if (s.width < 10 || s.height < 10) s = [UIScreen mainScreen].bounds.size;
     if (s.width < 10) return;
 
-    CGFloat margin = 14;
-    CGFloat w = s.width - margin * 2;
-    CGFloat headerH = 46;
-    CGFloat maxH = s.height * 0.74;
+    // 2.9.0: the panel is a vertical strip pinned to the RIGHT edge, not a
+    // bottom sheet. One column of icon+label rows, vertically centred.
+    CGFloat panelW = 118;
+    CGFloat margin = 10;
+    CGFloat headerH = 40;
+    CGFloat maxH = s.height - margin * 2;
     CGFloat contentH;
 
     if (_pickerMode) {
-        contentH = maxH;
+        contentH = MIN(maxH, s.height * 0.8);
     } else {
-        NSInteger cols = 4;
-        NSInteger n = [self panelItems].count + 1;
-        NSInteger rows = MAX(1, (n + cols - 1) / cols);
-        CGFloat tileW = (w - 32 - 12 * (cols - 1)) / cols;
-        CGFloat rowH = (tileW - 6) + 5 + 13;
-        contentH = headerH + 20 + rows * (rowH + 14) + 8;
-        contentH = MAX(MIN(contentH, maxH), headerH + 96);
+        NSInteger n = [self panelItems].count + 1;   // + "add" tile
+        CGFloat rowH = 62;
+        contentH = headerH + n * rowH + 12;
+        contentH = MIN(MAX(contentH, headerH + rowH), maxH);
     }
 
-    _sheet.frame = CGRectMake(margin, s.height - contentH - 22, w, contentH);
+    CGFloat x = s.width - panelW - margin;
+    CGFloat y = (s.height - contentH) / 2.0;
+    _sheet.frame = CGRectMake(x, y, panelW, contentH);
 
-    CGFloat pad = 16;
-    _titleLabel.frame = CGRectMake(pad, 13, 140, 22);
-    _closeBtn.frame = CGRectMake(w - pad - 34, 9, 34, 30);
-    _editBtn.frame = CGRectMake(w - pad - 34 - 56, 9, 56, 30);
+    CGFloat pad = 10;
+    _titleLabel.frame = CGRectMake(pad, 9, panelW - pad * 2 - 60, 22);
+    _titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    _closeBtn.frame = CGRectMake(panelW - 32, 5, 27, 28);
+    _editBtn.frame = CGRectMake(panelW - 32 - 44, 6, 44, 26);
+    _editBtn.titleLabel.font = [UIFont systemFontOfSize:11.5];
 
     CGFloat top = headerH;
     if (_pickerMode) {
-        _table.frame = CGRectMake(0, top, w, contentH - top);
+        _table.frame = CGRectMake(0, top, panelW, contentH - top);
     } else {
-        _scroll.frame = CGRectMake(0, top, w, contentH - top);
+        _scroll.frame = CGRectMake(0, top, panelW, contentH - top);
     }
-    _emptyLabel.frame = CGRectMake(pad, (contentH - 60) / 2, w - pad * 2, 60);
+    _emptyLabel.frame = CGRectMake(pad, (contentH - 60) / 2, panelW - pad * 2, 60);
+    _emptyLabel.font = [UIFont systemFontOfSize:12];
     _loadingLabel.frame = _emptyLabel.frame;
 
     [self layoutGrid];
@@ -746,30 +770,28 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     CGFloat w = _sheet.bounds.size.width;
     if (w < 10) return;
 
-    NSInteger cols = 4;
-    CGFloat pad = 16, gap = 12;
-    CGFloat tileW = (w - pad * 2 - gap * (cols - 1)) / cols;
-    CGFloat tileH = (tileW - 6) + 5 + 13;
+    // 2.9.0: one column, full width of the strip.
+    CGFloat pad = 10;
+    CGFloat tileW = w - pad * 2;
+    CGFloat rowGap = 6;
+    CGFloat rowH = 62;
 
     NSInteger total = items.count + 1;
-    NSInteger rows = (total + cols - 1) / cols;
-
     for (NSInteger i = 0; i < total; i++) {
         BOOL isAdd = (i == (NSInteger)items.count);
-        NSInteger r = i / cols, c = i % cols;
-        CGRect f = CGRectMake(pad + c * (tileW + gap), 10 + r * (tileH + 14), tileW, tileH);
+        CGRect f = CGRectMake(pad, 4 + i * (rowH + rowGap), tileW, rowH);
 
         SGTile *tile = [[SGTile alloc] initWithFrame:f];
+        tile.vertical = YES;
         if (isAdd) {
             tile.addTile = YES;
-            tile.iconView.image = [self plusIcon:60];
+            tile.iconView.image = [self plusIcon:40];
             tile.iconView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
             tile.nameLabel.text = @"添加";
         } else {
             SGCatalogItem *it = items[i];
             tile.item = it;
-            CGFloat iconSize = MIN(tileW - 6, 60.0);
-            tile.iconView.image = SGIconQuick(it, CGSizeMake(iconSize, iconSize));
+            tile.iconView.image = SGIconQuick(it, CGSizeMake(40, 40));
             tile.nameLabel.text = it.name ?: it.bundleID;
             tile.removeBtn.hidden = !_editing;
             [tile.removeBtn addTarget:self
@@ -780,10 +802,9 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
         [_scroll addSubview:tile];
     }
 
-    _scroll.contentSize = CGSizeMake(w, 10 + rows * (tileH + 14) + 8);
-    _emptyLabel.hidden = (items.count != 0) || _catalog != nil;
+    _scroll.contentSize = CGSizeMake(w, 4 + total * (rowH + rowGap) + 4);
+    _emptyLabel.hidden = (items.count != 0) || (_catalog != nil);
 
-    // upgrade placeholders to real icons off the main thread
     NSArray *snapshot = items;
     if (snapshot.count) {
         __weak SGLauncherVC *weakSelf = self;
@@ -2055,7 +2076,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.8.3 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.9.0 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
