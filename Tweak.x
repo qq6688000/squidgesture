@@ -1402,40 +1402,59 @@ static void sbSleepDisplay(void) {
             if ([backend respondsToSelector:bs])
                 before = ((int64_t(*)(id, SEL))objc_msgSend)(backend, bs);
             SGLog(@"sbSleepDisplay: backlightState before=%lld", before);
+            SEL it = NSSelectorFromString(@"isTransitioning");
+            SEL ia = NSSelectorFromString(@"isAlwaysOnEnabled");
+            BOOL transitioning = [backend respondsToSelector:it]
+                ? ((BOOL(*)(id, SEL))objc_msgSend)(backend, it) : NO;
+            BOOL alwaysOn = [backend respondsToSelector:ia]
+                ? ((BOOL(*)(id, SEL))objc_msgSend)(backend, ia) : NO;
+            SGLog(@"sbSleepDisplay: transitioning=%d alwaysOn=%d",
+                  transitioning, alwaysOn);
 
-            Class evCls = NSClassFromString(@"BLSBacklightChangeEvent");
-            id event = nil;
-            SEL initEv = NSSelectorFromString(
-                @"initWithEventID:state:previousState:changeRequest:");
-            if (evCls && [evCls instancesRespondToSelector:initEv]) {
-                id alloced = ((id(*)(id, SEL))objc_msgSend)(evCls,
-                                                            NSSelectorFromString(@"alloc"));
-                event = ((id(*)(id, SEL, id, int64_t, int64_t, id))objc_msgSend)(
-                    alloced, initEv, [NSUUID UUID], kInactive,
-                    (before >= 0 ? before : 1), nil);
+            // 3.1.3: constructing BLSBacklightChangeEvent with a guessed
+            // parameter layout killed the process (the log stopped right after
+            // backlightState). Never build these objects blind again.
+            //
+            // performChangeRequest: only needs a request object, and the
+            // backlight can produce one itself via its observer machinery.
+            // Try the class-method factories that exist on the real build,
+            // each guarded by respondsToSelector, and log before every call so
+            // a crash still leaves a breadcrumb.
+            Class reqCls = NSClassFromString(@"BLSBacklightChangeRequest");
+            SGLog(@"sbSleepDisplay: request class=%@", reqCls);
+
+            NSArray *factories = @[
+                @"requestWithRequestedActivityState:explanation:timestamp:sourceEvent:",
+                @"requestWithState:",
+                @"requestWithRequestedState:"
+            ];
+            for (NSString *fn in factories) {
+                SEL sel = NSSelectorFromString(fn);
+                if (!reqCls || ![reqCls respondsToSelector:sel]) continue;
+                SGLog(@"sbSleepDisplay: trying factory %@", fn);
+                @try {
+                    id req = nil;
+                    if ([fn hasSuffix:@"sourceEvent:"])
+                        req = ((id(*)(id, SEL, int64_t, id, double, int64_t))
+                               objc_msgSend)(reqCls, sel, kInactive,
+                                             @"SquidGesture", 0.0, 0);
+                    else if ([fn isEqualToString:@"requestWithState:"])
+                        req = ((id(*)(id, SEL, int64_t))objc_msgSend)(reqCls, sel, kInactive);
+                    else
+                        req = ((id(*)(id, SEL, int64_t))objc_msgSend)(reqCls, sel, kInactive);
+                    SGLog(@"sbSleepDisplay: factory %@ -> %@", fn,
+                          req ? @"ok" : @"nil");
+                    if (req) {
+                        ((void(*)(id, SEL, id))objc_msgSend)(
+                            backend, NSSelectorFromString(@"performChangeRequest:"), req);
+                        SGLog(@"sbSleepDisplay: performChangeRequest done");
+                        break;
+                    }
+                } @catch (NSException *e) {
+                    SGLog(@"sbSleepDisplay: %@ threw %@", fn, e.reason);
+                }
             }
-            SGLog(@"sbSleepDisplay: event=%@", event ? @"built" : @"nil");
 
-            SEL perform = NSSelectorFromString(@"performChangeRequest:");
-            BOOL canPerform = [backend respondsToSelector:perform];
-            SGLog(@"sbSleepDisplay: performChangeRequest=%@",
-                  canPerform ? @"yes" : @"no");
-
-            // performChangeRequest: wants a request; the event exposes one.
-            if (event && canPerform) {
-                SEL getReq = NSSelectorFromString(@"changeRequest");
-                id req = nil;
-                if ([event respondsToSelector:getReq])
-                    req = ((id(*)(id, SEL))objc_msgSend)(event, getReq);
-                SGLog(@"sbSleepDisplay: changeRequest=%@", req ? @"ok" : @"nil");
-
-                id arg = req ?: event;   // try the request, else the event
-                ((void(*)(id, SEL, id))objc_msgSend)(backend, perform, arg);
-                SGLog(@"sbSleepDisplay: performChangeRequest(%@)",
-                      req ? @"request" : @"event");
-            }
-
-            // Verify on the next runloop turn.
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
               int64_t after = -1;
@@ -2294,7 +2313,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.1.2 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.1.3 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
