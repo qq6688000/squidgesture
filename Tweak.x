@@ -1910,14 +1910,24 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     // own bounds made a top-right tap inside a small window look like top-left,
     // which is why the top-right double tap locked the screen instead of taking
     // a screenshot. Always convert to SCREEN space first.
-    CGPoint inWindow = [g locationInView:g.view];
+    // 2.8.2: the log showed "doubleTap 0,0" for every tap, so
+    // -convertPoint:toWindow:nil returned zero. On iOS 17 that call is not
+    // reliable inside SpringBoard. Compute screen coordinates directly:
+    // for a full-screen window its own coordinate space IS the screen.
     UIWindow *win = g.view.window;
-    CGPoint p = inWindow;
+    if (!win) win = g.view.superview.window;
+    if (!win) win = [UIApplication sharedApplication].keyWindow;
+
+    CGPoint p = CGPointZero;
+    CGRect scrB = [UIScreen mainScreen].bounds;
     if (win) {
-        @try {
-            p = [win convertPoint:inWindow toWindow:nil];   // -> screen coords
-        } @catch (__unused NSException *e) {
-            p = inWindow;
+        CGPoint inWin = [g locationInView:win];
+        if (win.bounds.size.width >= scrB.size.width * 0.9) {
+            p = inWin;                                  // full-screen window
+        } else {
+            // small overlay: add its own offset within the screen
+            p = CGPointMake(inWin.x + win.frame.origin.x,
+                            inWin.y + win.frame.origin.y);
         }
     }
 
@@ -1939,8 +1949,9 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     } @catch (__unused NSException *e) { }
 
     BOOL inBand = (p.y >= 0 && p.y <= bandH);
-    SGLog(@"doubleTap %.0f,%.0f band[0..%.0f] -> %d",
-          p.x, p.y, bandH, inBand);
+    SGLog(@"doubleTap %.0f,%.0f band[0..%.0f] -> %d (win=%@ %.0fx%.0f)",
+          p.x, p.y, bandH, inBand, NSStringFromClass([win class]),
+          win ? win.bounds.size.width : 0, win ? win.bounds.size.height : 0);
 
     if (inBand && gCornerTapPower) doPowerMenu();
 }
@@ -2015,7 +2026,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.8.1 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.8.2 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
