@@ -1622,96 +1622,91 @@ static void doScreenshot(void) {
     vibrate();
     SGLog(@"doScreenshot enter isSpringBoard=%d", isSpringBoard());
 
-    // 2.4.1: only SpringBoard can capture the display. A normal app is
-    // sandboxed away from the render server, so relay through a notification.
+    // 2.4.3
+    // - CARenderServerRenderDisplay is NOT safe: its arity differs between iOS
+    //   versions, so a 4-arg call into a 5-arg build smashes the stack and drops
+    //   SpringBoard into safe mode. Never call it again.
+    // - Every SpringBoard private screenshot class is gone on iOS 17.
+    // So: drive the hardware button combination through the HID system, which
+    // is the same path the physical buttons use and produces a genuine system
+    // screenshot (flash + saved to Photos).
     if (!isSpringBoard()) {
         notify_post(kNotifyShot);
         return;
     }
 
-    // The screenshots must be composited by the render server: capturing one
-    // UIWindow only yields that process's own layers, never the frontmost app.
-    // CARenderServerRenderDisplay asks the render server for the whole display.
-    // CARenderServerRenderDisplay(display_id, name, rect, flags)
-    // The name argument is a plain C string on modern builds.
-    typedef CGImageRef (*RenderDisplayFn)(uint32_t, CFStringRef, CGRect, int32_t);
-    static RenderDisplayFn renderDisplay = NULL;
-    static BOOL looked = NO;
-    if (!looked) {
-        looked = YES;
-        void *qc = dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore",
-                          RTLD_LAZY);
-        renderDisplay = (RenderDisplayFn)dlsym(qc ? qc : RTLD_DEFAULT,
-                                               "CARenderServerRenderDisplay");
-        SGLog(@"doScreenshot: CARenderServerRenderDisplay=%p", renderDisplay);
-    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+      @try {
+      Class cliCls = objc_getClass("IOHIDEventSystemClient");
+      Class evCls  = objc_getClass("IOHIDEvent");
 
-    UIScreen *scr = [UIScreen mainScreen];
-    CGRect full = scr.bounds;
-    UIImage *img = nil;
+      if (!cliCls || !evCls) {
+          SGLog(@"doScreenshot: IOKit classes missing");
+          return;
+      }
 
-    if (renderDisplay) {
-        @try {
-            CGImageRef cg = renderDisplay(0, (__bridge CFStringRef)@"LCD", full, 0);
-            if (cg) {
-                img = [UIImage imageWithCGImage:cg scale:scr.scale
-                                    orientation:UIImageOrientationUp];
-                CGImageRelease(cg);
-            }
-        } @catch (NSException *e) {
-            SGLog(@"doScreenshot: renderDisplay threw %@", e.reason);
-        }
-        SGLog(@"doScreenshot: renderDisplay image=%dx%d",
-              (int)img.size.width, (int)img.size.height);
-    }
+      id client = nil;
+      SEL sh = NSSelectorFromString(@"sharedInstance");
+      if ([cliCls respondsToSelector:sh])
+          client = ((id(*)(id, SEL))objc_msgSend)(cliCls, sh);
+      if (!client) {
+          SEL cr = NSSelectorFromString(@"create");
+          if ([cliCls respondsToSelector:cr])
+              client = ((id(*)(id, SEL))objc_msgSend)(cliCls, cr);
+      }
+      if (!client) { SGLog(@"doScreenshot: no HID client"); return; }
+      SGLog(@"doScreenshot: HID client %@", NSStringFromClass([client class]));
 
-    if (!img) SGLog(@"doScreenshot: render server path unavailable");
+      // Build a keyboard/virtual-key event pair. 0x0C = Consumer page:
+      //   0xE9 volume up, 0x30 power. Pressing both together is the
+      //   screenshot shortcut.
+      SEL mk = NSSelectorFromString(@"keyboardEvent:");
+      if (![evCls respondsToSelector:mk]) {
+          SGLog(@"doScreenshot: IOHIDEvent +keyboardEvent: missing");
+          return;
+      }
+      SEL disp = NSSelectorFromString(@"dispatchEvent:toDispatcher:");
+      if (![client respondsToSelector:disp]) {
+          SGLog(@"doScreenshot: dispatch selector missing");
+          return;
+      }
 
-    if (!img) {
-        // Fallback: composite our own windows (catches SpringBoard content only,
-        // but at least proves the pipeline works).
-        UIGraphicsBeginImageContextWithOptions(full.size, NO, scr.scale);
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (w.hidden || w.alpha < 0.01) continue;
-            if (w.windowLevel >= 4000) continue;
-            @try { [w drawViewHierarchyInRect:full afterScreenUpdates:NO]; }
-            @catch (__unused NSException *e) { }
-        }
-        img = UIGraphicsGetImageFromCurrentImageContext();
-        UIGraphicsEndImageContext();
-        SGLog(@"doScreenshot: window fallback %dx%d",
-              (int)img.size.width, (int)img.size.height);
-    }
+      __block int sent = 0;
+      void (^send)(int32_t, BOOL) = ^(int32_t usage, BOOL down) {
+          @try {
+              id ev = ((id(*)(id, SEL, int32_t))objc_msgSend)(evCls, mk, usage);
+              if (!ev) {
+                  SGLog(@"doScreenshot: event nil for usage 0x%x", usage);
+                  return;
+              }
+              // 0 = keyboard usage page; mark press/release through the
+              // integerValue so the HID stack reports a real key event.
+              SEL setV = NSSelectorFromString(@"setIntegerValue:");
+              if ([ev respondsToSelector:setV])
+                  ((void(*)(id, SEL, int64_t))objc_msgSend)(ev, setV, down ? 1 : 0);
+              ((void(*)(id, SEL, id, id))objc_msgSend)(client, disp, ev, nil);
+              sent++;
+          } @catch (NSException *e) {
+              SGLog(@"doScreenshot: send threw %@", e.reason);
+          }
+      };
 
-    if (!img) { SGLog(@"doScreenshot: nothing captured"); return; }
-
-    // Write into the camera roll directly. SpringBoard runs as mobile and
-    // DCIM is mobile-owned, so a plain file write lands in Photos without
-    // needing a Photos entitlement.
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *dcim = @"/var/mobile/Media/DCIM/100APPLE";
-    [fm createDirectoryAtPath:dcim withIntermediateDirectories:YES
-                   attributes:nil error:nil];
-    NSString *name = [NSString stringWithFormat:@"IMG_%.0f.JPG",
-                      [[NSDate date] timeIntervalSince1970]];
-    NSString *path = [dcim stringByAppendingPathComponent:name];
-    NSData *jpg = UIImageJPEGRepresentation(img, 0.95);
-    if (jpg && [jpg writeToFile:path atomically:YES]) {
-        SGLog(@"doScreenshot: wrote %@ (%lu bytes)", path, (unsigned long)jpg.length);
-        // Nudge Photos to index the new file.
-        notify_post("com.apple.mobileslideshow.assets.changed");
-        return;
-    }
-
-    // Last resort: keep a copy somewhere readable so the capture is not lost.
-    NSString *alt = [@"/var/mobile/Library/Preferences" stringByAppendingPathComponent:
-                     [NSString stringWithFormat:@"SquidShot-%.0f.JPG",
-                      [[NSDate date] timeIntervalSince1970]]];
-    if (jpg && [jpg writeToFile:alt atomically:YES]) {
-        SGLog(@"doScreenshot: wrote %@ (%lu bytes)", alt, (unsigned long)jpg.length);
-    } else {
-        SGLog(@"doScreenshot: write failed everywhere");
-    }
+      // side button down, volume up down, release both
+      send(0x30, YES);
+      send(0xE9, YES);
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                     dispatch_get_main_queue(), ^{
+        send(0xE9, NO);
+        send(0x30, NO);
+        SGLog(@"doScreenshot: button combo dispatched (%d events)", sent);
+        if (sent == 0)
+            SGLog(@"doScreenshot: HID rejected everything - no screenshot");
+      });
+      } @catch (NSException *e) {
+          // Nothing about a screenshot may ever take SpringBoard down.
+          SGLog(@"doScreenshot: aborted %@", e.reason);
+      }
+    });
 }
 
 #pragma mark - Gesture Handler
@@ -1990,7 +1985,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.4.1 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 2.4.3 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
