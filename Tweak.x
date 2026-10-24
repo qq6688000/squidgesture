@@ -351,6 +351,19 @@ static void SGPrewarmPanelApps(void) {
     });
 }
 
+// 3.0.0: UIKit honours _UIAnimationDragCoefficient every time it schedules an
+// animation, so 0.5 makes system transitions run at double speed. Applied only
+// around a panel-triggered launch, then restored.
+static void SGSetAnimationSpeed(CGFloat coefficient) {
+    Class ui = objc_getClass("UIView");
+    if (!ui) return;
+    SEL sel = NSSelectorFromString(@"_setAnimationDragCoefficient:");
+    if (![ui respondsToSelector:sel]) return;
+    @try {
+        ((void(*)(id, SEL, float))objc_msgSend)(ui, sel, (float)coefficient);
+    } @catch (__unused NSException *e) { }
+}
+
 static BOOL SGLaunchApp(NSString *bundleID) {
     if (!bundleID.length) return NO;
     id ws = SGLookupWorkspace();
@@ -830,16 +843,20 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
     SGCatalogItem *it = tile.item;
     SGPanelVibrate();
     NSString *bid = it.bundleID;
+    // 3.0.0: the panel now disappears in the same frame the app is activated,
+    // halving the perceived transition. hidePanelNow is synchronous so the
+    // window is already gone before activation starts.
     [self hidePanelNow];
-    // Give SpringBoard a couple of runloop turns after the window is hidden and
-    // key status is restored - activating an app mid-transition is what made
-    // the screen hang for 3-5 seconds.
     if (bid.length) {
-        // openApplicationWithBundleID: BLOCKS until the app is activated - the
-        // log measured 10039 ms on a cold start. Never call it on the main
-        // thread or SpringBoard (and the whole screen) freezes for that long.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+        // Only one runloop turn (was 0.35s). Still off the main thread because
+        // openApplicationWithBundleID: blocks until the app is frontmost.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
+                         // 3.0.0: the app-activation transition runs at double
+                         // speed. UIAnimationDragCoefficient < 1 shortens every
+                         // system animation; it is read once per animation, so
+                         // setting it here only affects this transition.
+                         SGSetAnimationSpeed(0.5);   // 2x faster transition
                          dispatch_async(
                              dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
                                NSTimeInterval t0 = [NSDate timeIntervalSinceReferenceDate];
@@ -851,6 +868,13 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
                                }
                                SGLog(@"launch %@ done ok=%d in %.0f ms", bid, ok,
                                      ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0);
+                               dispatch_after(
+                                   dispatch_time(DISPATCH_TIME_NOW,
+                                                 (int64_t)(0.6 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                                     SGSetAnimationSpeed(1.0);
+                                     SGLog(@"launch: animation speed restored");
+                                   });
                              });
                        });
     }
@@ -2259,7 +2283,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 2.9.6 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.0.0 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
