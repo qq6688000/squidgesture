@@ -1923,10 +1923,21 @@ static char kAttachedKey;
 // the recogniser starts tracking, so returning NO costs the app nothing.
 // 80pt is a generous ceiling - the handler still checks the exact band.
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
-    // UIGestureRecognizer implements this only to consult its delegate, and
-    // it is not part of UITapGestureRecognizer's public interface, so there
-    // is no super to chain to - the default is YES.
-    if (self.hasDown && self.downPoint.y > 80.0) return NO;
+    // 3.7.3: only ever begin inside the status-bar band.
+    //
+    // This recogniser reports single taps now (the pairing happens in the
+    // action), so it sees every touch on the device. Returning YES for
+    // anything below the band left it in Possible during Control Centre
+    // swipes - which start in this same top-right corner - and the system
+    // gesture had to wait for it to settle. That is what stopped screen
+    // recording from starting.
+    //
+    // Rejecting outside the band makes the recogniser fail on the very first
+    // touch, so it cannot hold anything up. 80pt ceiling, handler still
+    // checks the exact band afterwards.
+    if (!self.hasDown) return YES;
+    CGFloat y = self.downPoint.y;
+    if (y < -20.0 || y > 80.0) return NO;
     return YES;
 }
 @end
@@ -2369,7 +2380,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.7.2 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.7.3 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
