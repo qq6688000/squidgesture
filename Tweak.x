@@ -679,7 +679,9 @@ static SGCatalogItem *SGCatalogFind(NSArray<SGCatalogItem *> *catalog, NSString 
     // put a rendering load on SpringBoard that crashed it. A plain translucent
     // colour gets the same "you can see through it" effect with none of that
     // risk.
-    _sheet.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.62];
+    // 3.8.0: 全透明面板。没有底色，图标直接浮在桌面上，
+    // 面板之外的蒙层（_backdrop）不变。
+    _sheet.backgroundColor = [UIColor clearColor];
     [self.view addSubview:_sheet];
 
 
@@ -2380,7 +2382,7 @@ static void attachAllWindows(void) {
     loadPrefs();
     gDebugLog = YES;
     @try {
-        NSString *m = [NSString stringWithFormat:@"loaded 3.7.3 sb=%d pid=%d %@\n",
+        NSString *m = [NSString stringWithFormat:@"loaded 3.7.4 sb=%d pid=%d %@\n",
                        (int)isSpringBoard(), (int)getpid(), [NSDate date]];
         NSString *path = isSpringBoard()
             ? @"/var/mobile/Library/Preferences/com.minis.squidgesture.loaded"
